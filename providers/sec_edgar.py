@@ -213,4 +213,36 @@ class SecEdgarProvider:
                 if filed<=as_of: usable.append(x)
             by_fy={}
             for x in usable:
-                fy=int(x[
+                fy=int(x["fy"])
+                if fy not in by_fy or str(x.get("filed",""))>str(by_fy[fy].get("filed","")):
+                    by_fy[fy]=x
+            ordered=[by_fy[k] for k in sorted(by_fy)]
+            if ordered:
+                return ordered[-n:]
+        return []
+
+    def metrics_as_of(self, ticker, as_of, last_price=None):
+        """Fundamentals using only facts filed on or before as_of."""
+        facts=self.companyfacts(ticker)
+        if not facts: return {}
+        rev=self._annual_values_as_of(facts,["RevenueFromContractWithCustomerExcludingAssessedTax","Revenues","SalesRevenueNet"],as_of,"USD",3)
+        ni=self._annual_values_as_of(facts,["NetIncomeLoss"],as_of,"USD",3)
+        assets=self._annual_values_as_of(facts,["Assets"],as_of,"USD",2)
+        liab=self._annual_values_as_of(facts,["Liabilities"],as_of,"USD",2)
+        cfo=self._annual_values_as_of(facts,["NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],as_of,"USD",2)
+        capex=self._annual_values_as_of(facts,["PaymentsToAcquirePropertyPlantAndEquipment","PaymentsForAdditionsToPropertyPlantAndEquipment"],as_of,"USD",2)
+        def vals(xs): return [float(x["val"]) for x in xs]
+        rv,nv,av,lv,cv,xv=map(vals,[rev,ni,assets,liab,cfo,capex])
+        rg=(rv[-1]/rv[-2]-1)*100 if len(rv)>=2 and rv[-2] else None
+        nm=nv[-1]/rv[-1]*100 if rv and nv and rv[-1] else None
+        la=lv[-1]/av[-1] if av and lv and av[-1] else None
+        fm=None
+        if rv and cv and rv[-1]: fm=(cv[-1]-(xv[-1] if xv else 0))/rv[-1]*100
+        filed=[]
+        for group in (rev,ni,assets,liab,cfo,capex):
+            filed += [x.get("filed") for x in group if x.get("filed")]
+        return {
+            "revenue_growth_pct":rg,"net_margin_pct":nm,"liabilities_to_assets":la,"fcf_margin_pct":fm,
+            "pit_last_filed_date":max(filed) if filed else None,
+            "pit_fact_count":sum(len(g) for g in (rev,ni,assets,liab,cfo,capex)),
+            }
