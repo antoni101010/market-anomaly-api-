@@ -1,0 +1,15 @@
+version: 1.0
+universe_symbols: 55
+live_valid: 25
+dataset_rows: 1605
+signals_60d: 97
+avg_excess_60d_pct: 0.871
+bootstrap_ci95: [-3.843, 4.533]
+permutation_p_value: 0.6826
+regime_groups: 3
+sector_groups: 9
+cohorts: 33
+max_drawdown_pct: -53.252
+bias_grade: A
+bias_score_pct: 94.4
+alert_hits: 25
