@@ -8,6 +8,8 @@ di verità condivisa tra richieste/utenti.
 """
 from __future__ import annotations
 import math
+import threading
+from datetime import datetime, timezone
 import pandas as pd
 
 from config import CONFIG
@@ -51,7 +53,8 @@ def _row_to_dict(row: pd.Series) -> dict:
 
 
 def run_scan(limit: int = 100, catalyst_top_n: int = 7) -> dict:
-    """Esegue una scansione completa e la salva come 'ultima scansione' + storico."""
+    """Esegue una scansione completa e la salva come 'ultima scansione' + storico.
+    Funzione sincrona e bloccante — usata internamente dal thread in background."""
     universe = normalize_universe(build_demo_historical_universe(250))
     live_u = active_snapshot(universe, pd.Timestamp.today()).head(int(limit))
 
@@ -73,6 +76,63 @@ def run_scan(limit: int = 100, catalyst_top_n: int = 7) -> dict:
         "valid": int(len(valid)),
         "data_mode": CONFIG.data_mode,
     }
+
+
+# ---------------------------------------------------------------------------
+# Scansione in background: non blocca la richiesta HTTP.
+# Stato tenuto in memoria di processo (va bene per un singolo worker Render).
+# ---------------------------------------------------------------------------
+
+_scan_state = {
+    "status": "idle",       # idle | running | done | error
+    "message": "",
+    "limit": 0,
+    "started_at": None,
+    "finished_at": None,
+}
+_scan_lock = threading.Lock()
+
+
+def get_scan_status() -> dict:
+    with _scan_lock:
+        return dict(_scan_state)
+
+
+def _set_scan_state(**kwargs):
+    with _scan_lock:
+        _scan_state.update(kwargs)
+
+
+def _run_scan_thread(limit: int, catalyst_top_n: int):
+    try:
+        result = run_scan(limit=limit, catalyst_top_n=catalyst_top_n)
+        _set_scan_state(
+            status="done",
+            message=f"Completata: {result['valid']} titoli validi su {result['scanned']} analizzati.",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception as e:
+        _set_scan_state(
+            status="error",
+            message=str(e),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+
+def start_scan_background(limit: int = 100, catalyst_top_n: int = 7) -> dict:
+    with _scan_lock:
+        if _scan_state["status"] == "running":
+            return {"ok": False, "message": "Una scansione è già in corso."}
+        _scan_state.update(
+            status="running",
+            message="Scansione avviata...",
+            limit=int(limit),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=None,
+        )
+    thread = threading.Thread(target=_run_scan_thread, args=(limit, catalyst_top_n), daemon=True)
+    thread.start()
+    return {"ok": True, "message": "Scansione avviata in background."}
 
 
 def get_dashboard(min_opportunity: float = 55, max_value_trap: float = 65, top_n: int = 20) -> dict:
