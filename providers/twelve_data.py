@@ -17,7 +17,7 @@ class TwelveDataProvider:
         self.batch_size = max(1, min(int(batch_size), 50))
         self.cache = {}
         self.session = requests.Session()
-        retry = Retry(total=3, backoff_factor=0.7, status_forcelist=[429,500,502,503,504], allowed_methods=["GET"])
+        retry = Retry(total=6, backoff_factor=2.0, status_forcelist=[429,500,502,503,504], allowed_methods=["GET"], respect_retry_after_header=True)
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
