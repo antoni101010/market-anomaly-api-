@@ -20,6 +20,9 @@ class TwelveDataProvider:
         self.batch_size = max(1, min(int(batch_size), 8))
         self.cache = {}
         self.session = requests.Session()
+        # Nessun retry automatico su 429 qui: lo gestiamo noi manualmente,
+        # con attese complete di un minuto, per rispettare davvero il reset
+        # del contatore di crediti (un retry troppo rapido peggiora le cose).
         retry = Retry(total=3, backoff_factor=2.0, status_forcelist=[500,502,503,504], allowed_methods=["GET"])
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -76,6 +79,30 @@ class TwelveDataProvider:
             ["datetime","open","high","low","close","volume"]
         ].reset_index(drop=True)
 
+    def _get_with_429_retry(self, url, params, timeout, max_attempts=3, wait_seconds=65):
+        """GET resiliente al limite di crediti/minuto: su 429 aspetta un minuto
+        pieno e riprova, invece di arrendersi subito o ritentare troppo in fretta."""
+        last_exc = None
+        for attempt in range(max_attempts):
+            try:
+                r = self.session.get(url, params=params, timeout=timeout)
+                if r.status_code == 429:
+                    if attempt < max_attempts - 1:
+                        time.sleep(wait_seconds)
+                        continue
+                    r.raise_for_status()
+                r.raise_for_status()
+                return r
+            except requests.exceptions.HTTPError as e:
+                last_exc = e
+                if getattr(e.response, "status_code", None) == 429 and attempt < max_attempts - 1:
+                    time.sleep(wait_seconds)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Richiesta fallita senza risposta.")
+
     def daily_history(self, symbol, outputsize=300, adjust="splits"):
         symbol = symbol.upper()
         key = (symbol, int(outputsize), str(adjust))
@@ -87,7 +114,7 @@ class TwelveDataProvider:
             self.cache[key] = disk
             return disk.copy()
 
-        r = self.session.get(
+        r = self._get_with_429_retry(
             f"{self.BASE}/time_series",
             params={
                 "symbol":symbol, "interval":"1day", "outputsize":int(outputsize),
@@ -95,7 +122,6 @@ class TwelveDataProvider:
             },
             timeout=self.timeout
         )
-        r.raise_for_status()
         df = self._parse_item(r.json(), symbol)
         self.cache[key] = df
         self._save_disk(symbol, outputsize, adjust, df)
@@ -119,30 +145,36 @@ class TwelveDataProvider:
                 missing.append(s)
 
         # Pacchetti piccoli (<= 8 simboli, pari al limite di crediti/minuto) e
-        # una pausa di un minuto pieno tra un pacchetto e l'altro: unico modo
-        # per restare davvero dentro il piano gratuito senza errori 429.
+        # una pausa di un minuto pieno tra un pacchetto e l'altro. Se un
+        # pacchetto fallisce comunque per limite crediti, lo si ritenta invece
+        # di abortire l'intera scansione (che butterebbe via anche i dati già
+        # ottenuti per i pacchetti precedenti).
         chunks = [missing[i:i+self.batch_size] for i in range(0, len(missing), self.batch_size)]
         for i, chunk in enumerate(chunks):
             if i > 0:
                 time.sleep(61)
 
-            r = self.session.get(
-                f"{self.BASE}/time_series",
-                params={
-                    "symbol":",".join(chunk), "interval":"1day",
-                    "outputsize":int(outputsize), "order":"ASC",
-                    "adjust":adjust, "apikey":self.api_key,
-                },
-                timeout=max(self.timeout, 35)
-            )
-            r.raise_for_status()
-            data = r.json()
+            try:
+                r = self._get_with_429_retry(
+                    f"{self.BASE}/time_series",
+                    params={
+                        "symbol":",".join(chunk), "interval":"1day",
+                        "outputsize":int(outputsize), "order":"ASC",
+                        "adjust":adjust, "apikey":self.api_key,
+                    },
+                    timeout=max(self.timeout, 35)
+                )
+                data = r.json()
+            except Exception:
+                # Questo pacchetto non ce l'ha fatta nemmeno dopo i tentativi:
+                # saltalo e prosegui con i successivi, non perdere tutto il resto.
+                continue
 
             if len(chunk) == 1 and isinstance(data, dict) and "values" in data:
                 data = {chunk[0]: data}
 
             if isinstance(data, dict) and data.get("status") == "error":
-                raise RuntimeError(data.get("message", "Errore batch Twelve Data"))
+                continue
 
             for sym in chunk:
                 try:
@@ -155,3 +187,32 @@ class TwelveDataProvider:
                 except Exception:
                     # A missing/delisted ticker must not kill an entire large-universe scan.
                     continue
+
+        return result
+
+    def press_releases(self, symbol, limit=8):
+        r = self._get_with_429_retry(
+            f"{self.BASE}/press_releases",
+            params={"symbol":symbol, "apikey":self.api_key},
+            timeout=self.timeout
+        )
+        data = r.json()
+        if isinstance(data, dict) and data.get("status") == "error":
+            raise RuntimeError(data.get("message", "Errore press releases Twelve Data"))
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("data") or data.get("press_releases") or data.get("values") or data.get("results") or []
+        else:
+            items = []
+        out = []
+        for x in items[:int(limit)]:
+            if isinstance(x, dict):
+                out.append({
+                    "title":x.get("title") or x.get("headline") or x.get("name"),
+                    "text":x.get("body") or x.get("text") or x.get("summary") or x.get("description") or x.get("content"),
+                    "datetime":x.get("datetime") or x.get("published_at") or x.get("date") or x.get("timestamp"),
+                    "url":x.get("url") or x.get("link"),
+                    "source":x.get("source") or "Press release",
+                })
+        return out
