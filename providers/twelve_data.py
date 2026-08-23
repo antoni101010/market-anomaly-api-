@@ -11,13 +11,16 @@ import pandas as pd
 class TwelveDataProvider:
     BASE = "https://api.twelvedata.com"
 
-    def __init__(self, api_key, timeout=25, batch_size=25, cache_dir="data/price_cache"):
+    def __init__(self, api_key, timeout=25, batch_size=8, cache_dir="data/price_cache"):
         self.api_key = api_key
         self.timeout = timeout
-        self.batch_size = max(1, min(int(batch_size), 50))
+        # Piano gratuito Twelve Data: 8 crediti/minuto. Un pacchetto consuma
+        # 1 credito PER SIMBOLO contenuto, quindi il pacchetto stesso non può
+        # superare 8 simboli o sforiamo il limite già alla prima richiesta.
+        self.batch_size = max(1, min(int(batch_size), 8))
         self.cache = {}
         self.session = requests.Session()
-        retry = Retry(total=6, backoff_factor=2.0, status_forcelist=[429,500,502,503,504], allowed_methods=["GET"], respect_retry_after_header=True)
+        retry = Retry(total=3, backoff_factor=2.0, status_forcelist=[500,502,503,504], allowed_methods=["GET"])
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
@@ -115,9 +118,14 @@ class TwelveDataProvider:
             else:
                 missing.append(s)
 
-        # Chunking is important for large universes and keeps URLs manageable.
-        for start in range(0, len(missing), self.batch_size):
-            chunk = missing[start:start+self.batch_size]
+        # Pacchetti piccoli (<= 8 simboli, pari al limite di crediti/minuto) e
+        # una pausa di un minuto pieno tra un pacchetto e l'altro: unico modo
+        # per restare davvero dentro il piano gratuito senza errori 429.
+        chunks = [missing[i:i+self.batch_size] for i in range(0, len(missing), self.batch_size)]
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                time.sleep(61)
+
             r = self.session.get(
                 f"{self.BASE}/time_series",
                 params={
@@ -147,33 +155,3 @@ class TwelveDataProvider:
                 except Exception:
                     # A missing/delisted ticker must not kill an entire large-universe scan.
                     continue
-
-        return result
-
-    def press_releases(self, symbol, limit=8):
-        r = self.session.get(
-            f"{self.BASE}/press_releases",
-            params={"symbol":symbol, "apikey":self.api_key},
-            timeout=self.timeout
-        )
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict) and data.get("status") == "error":
-            raise RuntimeError(data.get("message", "Errore press releases Twelve Data"))
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = data.get("data") or data.get("press_releases") or data.get("values") or data.get("results") or []
-        else:
-            items = []
-        out = []
-        for x in items[:int(limit)]:
-            if isinstance(x, dict):
-                out.append({
-                    "title":x.get("title") or x.get("headline") or x.get("name"),
-                    "text":x.get("body") or x.get("text") or x.get("summary") or x.get("description") or x.get("content"),
-                    "datetime":x.get("datetime") or x.get("published_at") or x.get("date") or x.get("timestamp"),
-                    "url":x.get("url") or x.get("link"),
-                    "source":x.get("source") or "Press release",
-                })
-        return out
