@@ -29,7 +29,7 @@ import service
 
 app = FastAPI(
     title="Market Anomaly API",
-    version="1.0",
+    version="1.1",
     description="Backend per l'app Market Anomaly: scanner di anomalie post-earnings.",
 )
 
@@ -55,16 +55,21 @@ def health():
 
 @app.post("/api/scan")
 def trigger_scan(
-    limit: int = Query(100, ge=10, le=1000),
+    limit: int = Query(100, ge=10, le=2000),
     catalyst_top_n: int = Query(7, ge=1, le=25),
     x_api_key: str | None = Header(default=None),
 ):
+    """Avvia una scansione in BACKGROUND e ritorna subito (non blocca).
+    L'app deve poi interrogare /api/scan/status per sapere quando è finita."""
     _check_api_key(x_api_key)
-    try:
-        result = service.run_scan(limit=limit, catalyst_top_n=catalyst_top_n)
-        return {"ok": True, **result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = service.start_scan_background(limit=limit, catalyst_top_n=catalyst_top_n)
+    return result
+
+
+@app.get("/api/scan/status")
+def scan_status(x_api_key: str | None = Header(default=None)):
+    _check_api_key(x_api_key)
+    return service.get_scan_status()
 
 
 @app.get("/api/dashboard")
