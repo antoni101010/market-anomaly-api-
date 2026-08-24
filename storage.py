@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS latest_scan (
     market_mode TEXT,
     payload_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS scan_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    status TEXT NOT NULL,
+    message TEXT,
+    scan_limit INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    finished_at TEXT
+);
 """
 
 def _connect():
@@ -125,10 +134,6 @@ def _num(v):
     except Exception:
         return None
 
-# ---------------------------------------------------------------------------
-# Watchlist
-# ---------------------------------------------------------------------------
-
 def add_to_watchlist(ticker: str, company: str, price: float, anomaly_score: float, opportunity_score: float, notes: str = "") -> bool:
     with _connect() as con:
         try:
@@ -154,11 +159,7 @@ def list_watchlist() -> pd.DataFrame:
 def is_in_watchlist(ticker: str) -> bool:
     with _connect() as con:
         row = con.execute("SELECT 1 FROM watchlist WHERE ticker=?", (ticker.upper(),)).fetchone()
-        return row is not None
-
-# ---------------------------------------------------------------------------
-# Latest scan cache (replaces Streamlit's st.session_state for a stateless API)
-# ---------------------------------------------------------------------------
+    return row is not None
 
 def save_latest_scan(df: pd.DataFrame, market_mode: str) -> None:
     records = json.loads(df.to_json(orient="records", date_format="iso"))
@@ -171,7 +172,6 @@ def save_latest_scan(df: pd.DataFrame, market_mode: str) -> None:
         """,(now, market_mode, payload))
 
 def load_latest_scan():
-    """Returns (scan_time:str|None, market_mode:str|None, records:list[dict])"""
     with _connect() as con:
         row = con.execute("SELECT scan_time, market_mode, payload_json FROM latest_scan WHERE id=1").fetchone()
     if not row:
@@ -182,3 +182,37 @@ def load_latest_scan():
     except Exception:
         records = []
     return scan_time, market_mode, records
+
+def save_scan_state(state: dict) -> None:
+    with _connect() as con:
+        con.execute("""
+            INSERT INTO scan_state(id,status,message,scan_limit,started_at,finished_at)
+            VALUES(1,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+              status=excluded.status,
+              message=excluded.message,
+              scan_limit=excluded.scan_limit,
+              started_at=excluded.started_at,
+              finished_at=excluded.finished_at
+        """,(
+            str(state.get("status", "idle")),
+            str(state.get("message", "")),
+            int(state.get("limit", 0) or 0),
+            state.get("started_at"),
+            state.get("finished_at"),
+        ))
+
+def load_scan_state() -> dict | None:
+    with _connect() as con:
+        row = con.execute(
+            "SELECT status,message,scan_limit,started_at,finished_at FROM scan_state WHERE id=1"
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "status": row[0],
+        "message": row[1] or "",
+        "limit": int(row[2] or 0),
+        "started_at": row[3],
+        "finished_at": row[4],
+    }
