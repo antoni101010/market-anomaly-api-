@@ -1,10 +1,6 @@
 """
 Layer di servizio: incapsula il motore esistente (scanner, model, catalyst_engine,
 storage) in funzioni pulite, richiamabili da un'API stateless.
-
-Questo modulo NON reimplementa la logica quantitativa: riusa scanner.py così
-com'è. Sostituisce solo st.session_state con storage.py (SQLite) come fonte
-di verità condivisa tra richieste/utenti.
 """
 from __future__ import annotations
 import math
@@ -16,12 +12,11 @@ from config import CONFIG
 from scanner import scan_universe
 from providers.demo import DemoProvider
 from providers.twelve_data import TwelveDataProvider
-from providers.pit_demo import DemoPointInTimeFundamentals
-from providers.sec_edgar import SecEdgarProvider
 from universe_manager import normalize_universe, build_demo_historical_universe, active_snapshot
 from storage import (
     save_signals, load_signals, save_latest_scan, load_latest_scan,
     add_to_watchlist, remove_from_watchlist, list_watchlist, is_in_watchlist,
+    save_scan_state, load_scan_state,
 )
 from narrative import build_ticker_narrative
 
@@ -32,7 +27,10 @@ def _market_provider():
             raise RuntimeError(
                 "MARKET_ANOMALY_DATA_MODE=live ma TWELVE_DATA_API_KEY non è impostata sul server."
             )
-        return TwelveDataProvider(CONFIG.twelve_data_api_key, cache_dir=CONFIG.price_cache_dir)
+        return TwelveDataProvider(
+            CONFIG.twelve_data_api_key,
+            cache_dir=CONFIG.price_cache_dir,
+        )
     return DemoProvider()
 
 
@@ -41,7 +39,6 @@ def _include_sec() -> bool:
 
 
 def _clean_json_value(v):
-    """SQLite/JSON non gestiscono NaN: normalizza in None."""
     if isinstance(v, float) and math.isnan(v):
         return None
     return v
@@ -52,11 +49,12 @@ def _row_to_dict(row: pd.Series) -> dict:
     return {k: _clean_json_value(v) for k, v in d.items()}
 
 
-def run_scan(limit: int = 100, catalyst_top_n: int = 7) -> dict:
-    """Esegue una scansione completa e la salva come 'ultima scansione' + storico.
-    Funzione sincrona e bloccante — usata internamente dal thread in background."""
+def run_scan(limit: int = 40, catalyst_top_n: int = 5) -> dict:
     universe = normalize_universe(build_demo_historical_universe(250))
-    live_u = active_snapshot(universe, pd.Timestamp.today()).head(int(limit))
+    live_u = active_snapshot(
+        universe,
+        pd.Timestamp.today(),
+    ).head(int(limit))
 
     df = scan_universe(
         live_u,
@@ -78,19 +76,31 @@ def run_scan(limit: int = 100, catalyst_top_n: int = 7) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Scansione in background: non blocca la richiesta HTTP.
-# Stato tenuto in memoria di processo (va bene per un singolo worker Render).
-# ---------------------------------------------------------------------------
-
 _scan_state = {
-    "status": "idle",       # idle | running | done | error
+    "status": "idle",
     "message": "",
     "limit": 0,
     "started_at": None,
     "finished_at": None,
 }
 _scan_lock = threading.Lock()
+
+
+_persisted_state = load_scan_state()
+
+if _persisted_state:
+    _scan_state.update(_persisted_state)
+
+    if _scan_state["status"] == "running":
+        _scan_state.update(
+            status="error",
+            message=(
+                "La scansione è stata interrotta dal riavvio "
+                "del server. Riprova."
+            ),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        save_scan_state(_scan_state)
 
 
 def get_scan_status() -> dict:
@@ -101,16 +111,25 @@ def get_scan_status() -> dict:
 def _set_scan_state(**kwargs):
     with _scan_lock:
         _scan_state.update(kwargs)
+        save_scan_state(_scan_state)
 
 
 def _run_scan_thread(limit: int, catalyst_top_n: int):
     try:
-        result = run_scan(limit=limit, catalyst_top_n=catalyst_top_n)
+        result = run_scan(
+            limit=limit,
+            catalyst_top_n=catalyst_top_n,
+        )
+
         _set_scan_state(
             status="done",
-            message=f"Completata: {result['valid']} titoli validi su {result['scanned']} analizzati.",
+            message=(
+                f"Completata: {result['valid']} titoli validi "
+                f"su {result['scanned']} analizzati."
+            ),
             finished_at=datetime.now(timezone.utc).isoformat(),
         )
+
     except Exception as e:
         _set_scan_state(
             status="error",
@@ -119,10 +138,17 @@ def _run_scan_thread(limit: int, catalyst_top_n: int):
         )
 
 
-def start_scan_background(limit: int = 100, catalyst_top_n: int = 7) -> dict:
+def start_scan_background(
+    limit: int = 40,
+    catalyst_top_n: int = 5,
+) -> dict:
     with _scan_lock:
         if _scan_state["status"] == "running":
-            return {"ok": False, "message": "Una scansione è già in corso."}
+            return {
+                "ok": False,
+                "message": "Una scansione è già in corso.",
+            }
+
         _scan_state.update(
             status="running",
             message="Scansione avviata...",
@@ -130,32 +156,61 @@ def start_scan_background(limit: int = 100, catalyst_top_n: int = 7) -> dict:
             started_at=datetime.now(timezone.utc).isoformat(),
             finished_at=None,
         )
-    thread = threading.Thread(target=_run_scan_thread, args=(limit, catalyst_top_n), daemon=True)
+
+        save_scan_state(_scan_state)
+
+    thread = threading.Thread(
+        target=_run_scan_thread,
+        args=(limit, catalyst_top_n),
+        daemon=True,
+    )
     thread.start()
-    return {"ok": True, "message": "Scansione avviata in background."}
+
+    return {
+        "ok": True,
+        "message": "Scansione avviata in background.",
+    }
 
 
-def get_dashboard(min_opportunity: float = 55, max_value_trap: float = 65, top_n: int = 20) -> dict:
+def get_dashboard(
+    min_opportunity: float = 55,
+    max_value_trap: float = 65,
+    top_n: int = 20,
+) -> dict:
     scan_time, market_mode, records = load_latest_scan()
+
     if not records:
         return {
             "scan_time": None,
             "market_mode": market_mode,
             "top_anomalies": [],
-            "stats": {"analyzed": 0, "candidates": 0, "max_opportunity": None, "max_anomaly": None},
+            "stats": {
+                "analyzed": 0,
+                "candidates": 0,
+                "max_opportunity": None,
+                "max_anomaly": None,
+            },
         }
 
     df = pd.DataFrame(records)
     valid = df[df["error"].isna()] if "error" in df.columns else df
+
     candidates = valid[
-        (valid["opportunity_score"] >= min_opportunity) & (valid["value_trap_risk"] <= max_value_trap)
+        (valid["opportunity_score"] >= min_opportunity)
+        & (valid["value_trap_risk"] <= max_value_trap)
     ].copy()
-    candidates = candidates.sort_values("opportunity_score", ascending=False).head(int(top_n))
+
+    candidates = candidates.sort_values(
+        "opportunity_score",
+        ascending=False,
+    ).head(int(top_n))
 
     top = []
+
     for _, r in candidates.iterrows():
         d = _row_to_dict(r)
         cls = build_ticker_narrative(d)["classification"]
+
         top.append({
             "ticker": d.get("ticker"),
             "company": d.get("company"),
@@ -176,22 +231,37 @@ def get_dashboard(min_opportunity: float = 55, max_value_trap: float = 65, top_n
         "stats": {
             "analyzed": int(len(valid)),
             "candidates": int(len(candidates)),
-            "max_opportunity": float(valid["opportunity_score"].max()) if len(valid) else None,
-            "max_anomaly": float(valid["anomaly_score"].max()) if len(valid) else None,
+            "max_opportunity": (
+                float(valid["opportunity_score"].max())
+                if len(valid) else None
+            ),
+            "max_anomaly": (
+                float(valid["anomaly_score"].max())
+                if len(valid) else None
+            ),
         },
     }
 
 
 def get_ticker_detail(ticker: str) -> dict | None:
     _, _, records = load_latest_scan()
+
     if not records:
         return None
+
     ticker = ticker.upper()
-    match = [r for r in records if str(r.get("ticker", "")).upper() == ticker]
+
+    match = [
+        r for r in records
+        if str(r.get("ticker", "")).upper() == ticker
+    ]
+
     if not match:
         return None
+
     row = match[0]
     narrative = build_ticker_narrative(row)
+
     return {
         **row,
         "narrative": narrative,
@@ -201,8 +271,16 @@ def get_ticker_detail(ticker: str) -> dict | None:
 
 def add_watchlist_item(ticker: str) -> dict:
     detail = get_ticker_detail(ticker)
+
     if detail is None:
-        return {"ok": False, "message": f"Nessun dato recente per {ticker.upper()}. Esegui prima una scansione."}
+        return {
+            "ok": False,
+            "message": (
+                f"Nessun dato recente per {ticker.upper()}. "
+                "Esegui prima una scansione."
+            ),
+        }
+
     ok = add_to_watchlist(
         ticker=ticker,
         company=detail.get("company", ""),
@@ -210,7 +288,15 @@ def add_watchlist_item(ticker: str) -> dict:
         anomaly_score=detail.get("anomaly_score"),
         opportunity_score=detail.get("opportunity_score"),
     )
-    return {"ok": ok, "message": "Aggiunto alla watchlist." if ok else "Il titolo è già in watchlist."}
+
+    return {
+        "ok": ok,
+        "message": (
+            "Aggiunto alla watchlist."
+            if ok
+            else "Il titolo è già in watchlist."
+        ),
+    }
 
 
 def remove_watchlist_item(ticker: str) -> dict:
@@ -220,23 +306,35 @@ def remove_watchlist_item(ticker: str) -> dict:
 
 def get_watchlist() -> list[dict]:
     wl = list_watchlist()
+
     if wl.empty:
         return []
+
     _, _, records = load_latest_scan()
-    latest_by_ticker = {str(r.get("ticker", "")).upper(): r for r in records}
+
+    latest_by_ticker = {
+        str(r.get("ticker", "")).upper(): r
+        for r in records
+    }
 
     out = []
+
     for _, w in wl.iterrows():
         ticker = w["ticker"]
         latest = latest_by_ticker.get(ticker, {})
         current_price = latest.get("last_close")
         added_price = w.get("price_at_add")
         perf = None
+
         if current_price is not None and added_price:
             try:
-                perf = round((float(current_price) / float(added_price) - 1) * 100, 2)
+                perf = round(
+                    (float(current_price) / float(added_price) - 1) * 100,
+                    2,
+                )
             except Exception:
                 perf = None
+
         out.append({
             "ticker": ticker,
             "company": w.get("company"),
@@ -246,20 +344,36 @@ def get_watchlist() -> list[dict]:
             "performance_pct": perf,
             "anomaly_score_at_add": w.get("anomaly_score_at_add"),
             "anomaly_score_now": latest.get("anomaly_score"),
-            "opportunity_score_at_add": w.get("opportunity_score_at_add"),
-            "opportunity_score_now": latest.get("opportunity_score"),
+            "opportunity_score_at_add": (
+                w.get("opportunity_score_at_add")
+            ),
+            "opportunity_score_now": (
+                latest.get("opportunity_score")
+            ),
         })
+
     return out
 
 
 def get_history(limit: int = 500) -> list[dict]:
     hist = load_signals(limit=limit)
+
     if hist.empty:
         return []
+
     cols = [
-        "signal_time", "ticker", "company", "price", "anomaly_score",
-        "opportunity_score", "recovery_potential", "value_trap_risk",
-        "catalyst_risk", "quality_score",
+        "signal_time",
+        "ticker",
+        "company",
+        "price",
+        "anomaly_score",
+        "opportunity_score",
+        "recovery_potential",
+        "value_trap_risk",
+        "catalyst_risk",
+        "quality_score",
     ]
+
     cols = [c for c in cols if c in hist.columns]
+
     return hist[cols].to_dict(orient="records")
