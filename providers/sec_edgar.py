@@ -27,12 +27,10 @@ class SecEdgarProvider:
             user_agent
             or CONFIG.sec_user_agent
         )
-
         self.timeout = timeout
         self.min_interval = float(
             min_interval
         )
-
         self._last_request = 0.0
         self._ticker_map = None
         self._facts_cache = {}
@@ -205,60 +203,76 @@ class SecEdgarProvider:
         tags,
         units=("shares", "USD"),
     ):
-        usgaap = (
-            facts
-            .get("facts", {})
-            .get("us-gaap", {})
+        """
+        Cerca il dato più recente sia nel
+        namespace SEC dei sia in us-gaap.
+
+        EntityCommonStockSharesOutstanding
+        viene normalmente pubblicato in dei.
+        """
+
+        namespaces = facts.get(
+            "facts",
+            {},
         )
 
         if isinstance(tags, str):
             tags = [tags]
 
-        for tag in tags:
-            node = usgaap.get(tag)
+        for namespace in (
+            "dei",
+            "us-gaap",
+        ):
+            nodes = namespaces.get(
+                namespace,
+                {},
+            )
 
-            if not node:
-                continue
+            for tag in tags:
+                node = nodes.get(tag)
 
-            for unit in units:
-                rows = (
-                    node
-                    .get("units", {})
-                    .get(unit, [])
-                )
+                if not node:
+                    continue
 
-                rows = [
-                    row
-                    for row in rows
-                    if (
-                        row.get("val")
-                        is not None
-                        and row.get("filed")
+                for unit in units:
+                    rows = (
+                        node
+                        .get("units", {})
+                        .get(unit, [])
                     )
-                ]
 
-                if rows:
-                    rows = sorted(
-                        rows,
-                        key=lambda row: (
-                            str(
-                                row.get(
-                                    "filed",
-                                    "",
-                                )
+                    rows = [
+                        row
+                        for row in rows
+                        if (
+                            row.get("val")
+                            is not None
+                            and row.get("filed")
+                        )
+                    ]
+
+                    if rows:
+                        rows = sorted(
+                            rows,
+                            key=lambda row: (
+                                str(
+                                    row.get(
+                                        "filed",
+                                        "",
+                                    )
+                                ),
+                                str(
+                                    row.get(
+                                        "end",
+                                        "",
+                                    )
+                                ),
                             ),
-                            str(
-                                row.get(
-                                    "end",
-                                    "",
-                                )
-                            ),
-                        ),
-                    )
+                        )
 
-                    return float(
-                        rows[-1]["val"]
-                    )
+                        return float(
+                            rows[-1]["val"]
+                        )
 
         return None
 
@@ -409,10 +423,6 @@ class SecEdgarProvider:
             facts,
             [
                 (
-                    "CommonStocksIncluding"
-                    "AdditionalPaidInCapitalMember"
-                ),
-                (
                     "EntityCommonStock"
                     "SharesOutstanding"
                 ),
@@ -429,8 +439,8 @@ class SecEdgarProvider:
         fcf_yield_pct = None
 
         if (
-            last_price
-            and shares
+            last_price is not None
+            and shares is not None
             and shares > 0
         ):
             market_cap = (
@@ -481,6 +491,9 @@ class SecEdgarProvider:
             ),
             "free_cash_flow_ttm": (
                 free_cash_flow
+            ),
+            "shares_outstanding": (
+                shares
             ),
             "approx_pe": (
                 approximate_pe
@@ -550,7 +563,7 @@ class SecEdgarProvider:
             "accessionNumber",
             [],
         )
-        primary_documents = recent.get(
+        documents = recent.get(
             "primaryDocument",
             [],
         )
@@ -570,9 +583,8 @@ class SecEdgarProvider:
             )
 
             document = (
-                primary_documents[index]
-                if index
-                < len(primary_documents)
+                documents[index]
+                if index < len(documents)
                 else None
             )
 
