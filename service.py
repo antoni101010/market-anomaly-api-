@@ -1,6 +1,6 @@
 """
 Layer di servizio:
-collega scanner, provider dati, storage e API.
+collega scanner, provider, storage e API.
 """
 
 from __future__ import annotations
@@ -17,9 +17,7 @@ from scanner import (
     build_light_universe,
 )
 from providers.demo import DemoProvider
-from providers.twelve_data import (
-    TwelveDataProvider,
-)
+from providers.twelve_data import TwelveDataProvider
 from providers.eodhd import EODHDProvider
 
 from universe_manager import (
@@ -41,29 +39,79 @@ from storage import (
     load_scan_state,
 )
 
-from narrative import (
-    build_ticker_narrative,
-)
+from narrative import build_ticker_narrative
+
+
+# Universo reale temporaneo usato solamente
+# quando il piano EODHD blocca lo Screener.
+#
+# Permette di continuare lo sviluppo con dati reali,
+# ma non sostituisce la futura scansione globale.
+FALLBACK_LIVE_UNIVERSE = [
+    {
+        "ticker": "AAPL.US",
+        "display_ticker": "AAPL",
+        "company": "Apple",
+        "sector_etf": "SPY",
+    },
+    {
+        "ticker": "MSFT.US",
+        "display_ticker": "MSFT",
+        "company": "Microsoft",
+        "sector_etf": "SPY",
+    },
+    {
+        "ticker": "NVDA.US",
+        "display_ticker": "NVDA",
+        "company": "NVIDIA",
+        "sector_etf": "SPY",
+    },
+    {
+        "ticker": "AMZN.US",
+        "display_ticker": "AMZN",
+        "company": "Amazon",
+        "sector_etf": "SPY",
+    },
+    {
+        "ticker": "GOOGL.US",
+        "display_ticker": "GOOGL",
+        "company": "Alphabet",
+        "sector_etf": "SPY",
+    },
+    {
+        "ticker": "META.US",
+        "display_ticker": "META",
+        "company": "Meta Platforms",
+        "sector_etf": "SPY",
+    },
+    {
+        "ticker": "TSLA.US",
+        "display_ticker": "TSLA",
+        "company": "Tesla",
+        "sector_etf": "SPY",
+    },
+    {
+        "ticker": "CRM.US",
+        "display_ticker": "CRM",
+        "company": "Salesforce",
+        "sector_etf": "SPY",
+    },
+]
 
 
 def _market_provider():
     if CONFIG.data_mode == "live":
 
-        if (
-            CONFIG.market_data_provider
-            == "eodhd"
-        ):
+        if CONFIG.market_data_provider == "eodhd":
             if not CONFIG.eodhd_api_key:
                 raise RuntimeError(
-                    "EODHD_API_KEY non è "
-                    "impostata sul server."
+                    "EODHD_API_KEY non è impostata "
+                    "sul server."
                 )
 
             return EODHDProvider(
                 CONFIG.eodhd_api_key,
-                cache_dir=(
-                    CONFIG.price_cache_dir
-                ),
+                cache_dir=CONFIG.price_cache_dir,
             )
 
         if (
@@ -78,9 +126,7 @@ def _market_provider():
 
             return TwelveDataProvider(
                 CONFIG.twelve_data_api_key,
-                cache_dir=(
-                    CONFIG.price_cache_dir
-                ),
+                cache_dir=CONFIG.price_cache_dir,
             )
 
         raise RuntimeError(
@@ -92,10 +138,7 @@ def _market_provider():
 
 
 def _include_sec() -> bool:
-    return (
-        CONFIG.data_mode
-        == "live"
-    )
+    return CONFIG.data_mode == "live"
 
 
 def _clean_json_value(value):
@@ -108,10 +151,7 @@ def _clean_json_value(value):
     return value
 
 
-def _row_to_dict(
-    row: pd.Series,
-) -> dict:
-
+def _row_to_dict(row: pd.Series) -> dict:
     data = row.to_dict()
 
     return {
@@ -125,57 +165,74 @@ def _build_live_shortlist(
     limit: int,
 ) -> pd.DataFrame:
     """
-    Prima fase veloce:
+    Prova prima lo Screener EODHD.
 
-    usa lo screener EODHD e crea
-    una shortlist reale.
+    Se il piano restituisce HTTP 403,
+    utilizza un universo reale ridotto
+    per permettere lo sviluppo dell'app.
     """
 
-    shortlist = build_light_universe(
-        market_provider=provider,
-        exchanges=("us",),
-        max_return_1d_pct=-8.0,
-        min_avg_volume=200_000,
-        min_price=2.0,
-        min_market_cap=500_000_000,
-        limit_per_exchange=max(
-            20,
-            min(
-                int(limit),
-                100,
+    try:
+        shortlist = build_light_universe(
+            market_provider=provider,
+            exchanges=("us",),
+            max_return_1d_pct=-8.0,
+            min_avg_volume=200_000,
+            min_price=2.0,
+            min_market_cap=500_000_000,
+            limit_per_exchange=max(
+                20,
+                min(
+                    int(limit),
+                    100,
+                ),
             ),
-        ),
-    )
+        )
+
+    except RuntimeError as error:
+        if "HTTP 403" not in str(error):
+            raise
+
+        shortlist = pd.DataFrame(
+            FALLBACK_LIVE_UNIVERSE
+        )
+
+        shortlist[
+            "light_scanner_mode"
+        ] = "fallback_without_screener"
+
+        shortlist[
+            "light_scanner_note"
+        ] = (
+            "Screener EODHD non incluso nel "
+            "piano: universo reale ridotto "
+            "utilizzato per lo sviluppo."
+        )
 
     if shortlist is None:
         raise RuntimeError(
-            "Il provider selezionato "
-            "non supporta il Light Scanner."
+            "Il provider selezionato non "
+            "supporta il Light Scanner."
         )
 
     if shortlist.empty:
         return shortlist
 
-    shortlist = shortlist.head(
+    return shortlist.head(
         int(limit)
     )
-
-    return shortlist
 
 
 def run_scan(
     limit: int = 40,
     catalyst_top_n: int = 5,
 ) -> dict:
-
     provider = _market_provider()
 
     if CONFIG.data_mode == "live":
-        live_universe = (
-            _build_live_shortlist(
-                provider,
-                limit=limit,
-            )
+        live_universe = _build_live_shortlist(
+            provider,
+            limit=limit,
         )
 
         if live_universe.empty:
@@ -194,6 +251,9 @@ def run_scan(
                     CONFIG.market_data_provider
                 ),
                 "light_candidates": 0,
+                "scanner_mode": (
+                    "eodhd_screener"
+                ),
             }
 
     else:
@@ -237,6 +297,17 @@ def run_scan(
             valid
         )
 
+    scanner_mode = (
+        str(
+            live_universe.iloc[0].get(
+                "light_scanner_mode",
+                "eodhd_screener",
+            )
+        )
+        if len(live_universe)
+        else "eodhd_screener"
+    )
+
     return {
         "scanned": int(
             len(result)
@@ -253,6 +324,7 @@ def run_scan(
         "light_candidates": int(
             len(live_universe)
         ),
+        "scanner_mode": scanner_mode,
     }
 
 
@@ -266,26 +338,19 @@ _scan_state = {
 
 _scan_lock = threading.Lock()
 
-
-_persisted_state = (
-    load_scan_state()
-)
+_persisted_state = load_scan_state()
 
 if _persisted_state:
     _scan_state.update(
         _persisted_state
     )
 
-    if (
-        _scan_state["status"]
-        == "running"
-    ):
+    if _scan_state["status"] == "running":
         _scan_state.update(
             status="error",
             message=(
-                "La scansione è stata "
-                "interrotta dal riavvio "
-                "del server. Riprova."
+                "La scansione è stata interrotta "
+                "dal riavvio del server. Riprova."
             ),
             finished_at=datetime.now(
                 timezone.utc
@@ -322,19 +387,17 @@ def _run_scan_thread(
     try:
         result = run_scan(
             limit=limit,
-            catalyst_top_n=(
-                catalyst_top_n
-            ),
+            catalyst_top_n=catalyst_top_n,
         )
 
         _set_scan_state(
             status="done",
             message=(
                 f"Completata: "
-                f"{result['valid']} titoli "
-                f"validi su "
-                f"{result['scanned']} "
-                f"analizzati."
+                f"{result['valid']} titoli validi "
+                f"su {result['scanned']} analizzati. "
+                f"Modalità scanner: "
+                f"{result['scanner_mode']}."
             ),
             finished_at=datetime.now(
                 timezone.utc
@@ -355,17 +418,12 @@ def start_scan_background(
     limit: int = 40,
     catalyst_top_n: int = 5,
 ) -> dict:
-
     with _scan_lock:
-        if (
-            _scan_state["status"]
-            == "running"
-        ):
+        if _scan_state["status"] == "running":
             return {
                 "ok": False,
                 "message": (
-                    "Una scansione è "
-                    "già in corso."
+                    "Una scansione è già in corso."
                 ),
             }
 
@@ -397,8 +455,7 @@ def start_scan_background(
     return {
         "ok": True,
         "message": (
-            "Scansione avviata "
-            "in background."
+            "Scansione avviata in background."
         ),
     }
 
@@ -408,7 +465,6 @@ def get_dashboard(
     max_value_trap: float = 65,
     top_n: int = 20,
 ) -> dict:
-
     (
         scan_time,
         market_mode,
@@ -452,7 +508,8 @@ def get_dashboard(
     ].copy()
 
     candidates = (
-        candidates.sort_values(
+        candidates
+        .sort_values(
             "opportunity_score",
             ascending=False,
         )
@@ -561,7 +618,6 @@ def get_dashboard(
 def get_ticker_detail(
     ticker: str,
 ) -> dict | None:
-
     _, _, records = (
         load_latest_scan()
     )
@@ -608,7 +664,6 @@ def get_ticker_detail(
 def add_watchlist_item(
     ticker: str,
 ) -> dict:
-
     detail = get_ticker_detail(
         ticker
     )
@@ -656,7 +711,6 @@ def add_watchlist_item(
 def remove_watchlist_item(
     ticker: str,
 ) -> dict:
-
     remove_from_watchlist(
         ticker
     )
@@ -771,7 +825,6 @@ def get_watchlist() -> list[dict]:
 def get_history(
     limit: int = 500,
 ) -> list[dict]:
-
     history = load_signals(
         limit=limit
     )
