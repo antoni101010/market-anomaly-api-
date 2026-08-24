@@ -10,7 +10,7 @@ import requests
 
 
 class EODHDProvider:
-    """Provider dati di mercato EODHD per Market Anomaly."""
+    """Provider EODHD per Market Anomaly."""
 
     BASE = "https://eodhd.com/api"
 
@@ -25,10 +25,8 @@ class EODHDProvider:
 
         self.api_key = api_key
         self.timeout = int(timeout)
-
         self.cache_dir = Path(cache_dir) / "eodhd"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-
         self.session = requests.Session()
         self.cache: dict[tuple[str, int], pd.DataFrame] = {}
 
@@ -41,36 +39,94 @@ class EODHDProvider:
 
         return f"{symbol}.{exchange.upper()}"
 
-    def _request(self, path: str, params: dict | None = None):
+    def _request(
+        self,
+        path: str,
+        params: dict | None = None,
+    ):
         query = dict(params or {})
-
         query["api_token"] = self.api_key
         query.setdefault("fmt", "json")
 
-        response = self.session.get(
-            f"{self.BASE}/{path.lstrip('/')}",
-            params=query,
-            timeout=self.timeout,
-        )
+        try:
+            response = self.session.get(
+                f"{self.BASE}/{path.lstrip('/')}",
+                params=query,
+                timeout=self.timeout,
+            )
 
-        response.raise_for_status()
+        except requests.RequestException as error:
+            raise RuntimeError(
+                "Impossibile collegarsi a EODHD."
+            ) from error
 
-        data = response.json()
+        # Non utilizziamo raise_for_status perché
+        # mostrerebbe l'indirizzo completo con il token.
+        if response.status_code == 401:
+            raise RuntimeError(
+                "EODHD: token non valido oppure "
+                "non autorizzato (HTTP 401)."
+            )
+
+        if response.status_code == 403:
+            raise RuntimeError(
+                "EODHD: questo endpoint non è incluso "
+                "nel piano attuale (HTTP 403)."
+            )
+
+        if response.status_code == 429:
+            raise RuntimeError(
+                "EODHD: limite di richieste raggiunto "
+                "(HTTP 429)."
+            )
+
+        if not response.ok:
+            raise RuntimeError(
+                "EODHD ha restituito un errore "
+                f"HTTP {response.status_code}."
+            )
+
+        try:
+            data = response.json()
+
+        except ValueError as error:
+            raise RuntimeError(
+                "EODHD ha restituito una risposta "
+                "non valida."
+            ) from error
 
         if isinstance(data, dict) and data.get("error"):
-            raise RuntimeError(str(data["error"]))
+            raise RuntimeError(
+                "EODHD ha restituito un errore: "
+                + str(data["error"])
+            )
 
         return data
 
-    def _cache_path(self, symbol: str, outputsize: int) -> Path:
-        safe_symbol = symbol.replace("/", "_").replace(".", "_")
+    def _cache_path(
+        self,
+        symbol: str,
+        outputsize: int,
+    ) -> Path:
+        safe_symbol = (
+            symbol
+            .replace("/", "_")
+            .replace(".", "_")
+        )
 
         return self.cache_dir / (
             f"{safe_symbol}_{int(outputsize)}.csv"
         )
 
-    def _fundamentals_cache_path(self, symbol: str) -> Path:
-        safe_symbol = symbol.replace("/", "_").replace(".", "_")
+    def _fundamentals_cache_path(
+        self,
+        symbol: str,
+    ) -> Path:
+        safe_symbol = (
+            symbol
+            .replace("/", "_")
+            .replace(".", "_")
+        )
 
         return self.cache_dir / (
             f"{safe_symbol}_fundamentals.json"
@@ -96,8 +152,6 @@ class EODHDProvider:
         if number is None:
             return None
 
-        # EODHD restituisce normalmente
-        # margini e crescite come frazioni.
         return (
             number * 100.0
             if abs(number) <= 2.0
@@ -109,7 +163,6 @@ class EODHDProvider:
         section: dict | None,
         limit: int = 4,
     ) -> list[dict]:
-
         if not isinstance(section, dict):
             return []
 
@@ -138,25 +191,21 @@ class EODHDProvider:
         values = []
 
         for period in periods:
-            value = next(
-                (
-                    cls._number(period.get(key))
-                    for key in keys
-                    if cls._number(
-                        period.get(key)
-                    ) is not None
-                ),
-                None,
-            )
+            value = None
+
+            for key in keys:
+                candidate = cls._number(
+                    period.get(key)
+                )
+
+                if candidate is not None:
+                    value = candidate
+                    break
 
             if value is not None:
                 values.append(value)
 
-        return (
-            sum(values)
-            if values
-            else None
-        )
+        return sum(values) if values else None
 
     @classmethod
     def _parse_fundamentals(
@@ -164,10 +213,10 @@ class EODHDProvider:
         data: dict,
         symbol: str,
     ) -> dict:
-
         if not isinstance(data, dict) or not data:
             raise RuntimeError(
-                f"Fondamentali EODHD non disponibili per {symbol}"
+                "Fondamentali EODHD non disponibili "
+                f"per {symbol}"
             )
 
         general = data.get("General") or {}
@@ -180,12 +229,10 @@ class EODHDProvider:
             financials.get("Income_Statement")
             or {}
         )
-
         balance = (
             financials.get("Balance_Sheet")
             or {}
         )
-
         cash_flow = (
             financials.get("Cash_Flow")
             or {}
@@ -195,17 +242,14 @@ class EODHDProvider:
             income.get("quarterly"),
             4,
         )
-
         balance_q = cls._latest_periods(
             balance.get("quarterly"),
             2,
         )
-
         cash_q = cls._latest_periods(
             cash_flow.get("quarterly"),
             4,
         )
-
         balance_y = cls._latest_periods(
             balance.get("yearly"),
             2,
@@ -252,24 +296,20 @@ class EODHDProvider:
             income_q,
             "operatingIncome",
         )
-
         net_income_ttm = cls._sum_periods(
             income_q,
             "netIncome",
         )
-
         operating_cash_ttm = cls._sum_periods(
             cash_q,
             "totalCashFromOperatingActivities",
             "cashFromOperatingActivities",
         )
-
         capex_ttm = cls._sum_periods(
             cash_q,
             "capitalExpenditures",
             "capitalExpenditure",
         )
-
         free_cash_flow = cls._sum_periods(
             cash_q,
             "freeCashFlow",
@@ -287,11 +327,8 @@ class EODHDProvider:
             )
 
         market_cap = cls._number(
-            highlights.get(
-                "MarketCapitalization"
-            )
+            highlights.get("MarketCapitalization")
         )
-
         ebitda = cls._number(
             highlights.get("EBITDA")
         )
@@ -305,26 +342,18 @@ class EODHDProvider:
         total_assets = cls._number(
             latest_balance.get("totalAssets")
         )
-
         total_liabilities = cls._number(
             latest_balance.get("totalLiab")
-            or latest_balance.get(
-                "totalLiabilities"
-            )
+            or latest_balance.get("totalLiabilities")
         )
-
         current_assets = cls._number(
-            latest_balance.get(
-                "totalCurrentAssets"
-            )
+            latest_balance.get("totalCurrentAssets")
         )
-
         current_liabilities = cls._number(
             latest_balance.get(
                 "totalCurrentLiabilities"
             )
         )
-
         total_debt = cls._number(
             latest_balance.get(
                 "shortLongTermDebtTotal"
@@ -334,7 +363,6 @@ class EODHDProvider:
                 "shortLongTermDebt"
             )
         )
-
         cash = cls._number(
             latest_balance.get(
                 "cashAndShortTermInvestments"
@@ -355,8 +383,6 @@ class EODHDProvider:
                 interest_expense
             )
 
-        # Per la crescita delle azioni usiamo
-        # due periodi annuali omogenei.
         current_shares = (
             cls._number(
                 balance_y[0].get(
@@ -457,9 +483,7 @@ class EODHDProvider:
             ),
             "net_margin_pct": (
                 cls._percent(
-                    highlights.get(
-                        "ProfitMargin"
-                    )
+                    highlights.get("ProfitMargin")
                 )
                 or ratio(
                     net_income_ttm,
@@ -469,9 +493,7 @@ class EODHDProvider:
             ),
             "fcf_margin_pct": fcf_margin,
             "roe_pct": cls._percent(
-                highlights.get(
-                    "ReturnOnEquityTTM"
-                )
+                highlights.get("ReturnOnEquityTTM")
             ),
             "pe_ratio": (
                 cls._number(
@@ -539,8 +561,7 @@ class EODHDProvider:
             "cash_runway_months": cash_runway,
             "shares_outstanding_growth_pct": (
                 ratio(
-                    current_shares
-                    - previous_shares,
+                    current_shares - previous_shares,
                     previous_shares,
                     100.0,
                 )
@@ -557,15 +578,9 @@ class EODHDProvider:
         symbol: str,
         max_age_hours: int = 24,
     ) -> dict:
-
-        api_symbol = self._api_symbol(
-            symbol
-        )
-
-        cache_path = (
-            self._fundamentals_cache_path(
-                api_symbol
-            )
+        api_symbol = self._api_symbol(symbol)
+        cache_path = self._fundamentals_cache_path(
+            api_symbol
         )
 
         if cache_path.exists():
@@ -583,12 +598,14 @@ class EODHDProvider:
                 * 3600
             ):
                 try:
+                    cached_data = json.loads(
+                        cache_path.read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
                     return self._parse_fundamentals(
-                        json.loads(
-                            cache_path.read_text(
-                                encoding="utf-8"
-                            )
-                        ),
+                        cached_data,
                         api_symbol,
                     )
 
@@ -620,24 +637,24 @@ class EODHDProvider:
         symbol: str,
         outputsize: int,
     ) -> pd.DataFrame:
-
         if not isinstance(data, list) or not data:
             raise RuntimeError(
                 f"Nessun dato EODHD per {symbol}"
             )
 
-        df = pd.DataFrame(data)
+        dataframe = pd.DataFrame(data)
 
         if (
-            "date" not in df.columns
-            or "close" not in df.columns
+            "date" not in dataframe.columns
+            or "close" not in dataframe.columns
         ):
             raise RuntimeError(
-                f"Risposta EODHD non valida per {symbol}"
+                "Risposta EODHD non valida "
+                f"per {symbol}"
             )
 
-        if "volume" not in df.columns:
-            df["volume"] = 0
+        if "volume" not in dataframe.columns:
+            dataframe["volume"] = 0
 
         for column in [
             "open",
@@ -646,26 +663,28 @@ class EODHDProvider:
             "close",
             "volume",
         ]:
-            if column not in df.columns:
+            if column not in dataframe.columns:
                 if column == "volume":
-                    df[column] = 0
+                    dataframe[column] = 0
                 else:
                     raise RuntimeError(
-                        f"Campo {column} mancante per {symbol}"
+                        f"Campo {column} mancante "
+                        f"per {symbol}"
                     )
 
-            df[column] = pd.to_numeric(
-                df[column],
+            dataframe[column] = pd.to_numeric(
+                dataframe[column],
                 errors="coerce",
             )
 
-        df["datetime"] = pd.to_datetime(
-            df["date"],
+        dataframe["datetime"] = pd.to_datetime(
+            dataframe["date"],
             errors="coerce",
         )
 
-        df = (
-            df.dropna(
+        dataframe = (
+            dataframe
+            .dropna(
                 subset=["datetime", "close"]
             )
             .sort_values("datetime")
@@ -682,12 +701,12 @@ class EODHDProvider:
             .reset_index(drop=True)
         )
 
-        if df.empty:
+        if dataframe.empty:
             raise RuntimeError(
                 f"Storico EODHD vuoto per {symbol}"
             )
 
-        return df
+        return dataframe
 
     def daily_history(
         self,
@@ -695,7 +714,6 @@ class EODHDProvider:
         outputsize: int = 300,
         adjust: str = "splits",
     ) -> pd.DataFrame:
-
         key = (
             str(symbol).upper(),
             int(outputsize),
@@ -704,7 +722,9 @@ class EODHDProvider:
         if key in self.cache:
             return self.cache[key].copy()
 
-        path = self._cache_path(*key)
+        path = self._cache_path(
+            *key
+        )
 
         if path.exists():
             try:
@@ -735,20 +755,20 @@ class EODHDProvider:
             },
         )
 
-        df = self._parse_history(
+        dataframe = self._parse_history(
             data,
             api_symbol,
             outputsize,
         )
 
-        df.to_csv(
+        dataframe.to_csv(
             path,
             index=False,
         )
 
-        self.cache[key] = df
+        self.cache[key] = dataframe
 
-        return df.copy()
+        return dataframe.copy()
 
     def screen_candidates(
         self,
@@ -760,73 +780,8 @@ class EODHDProvider:
         limit_per_exchange: int = 100,
     ) -> pd.DataFrame:
         """
-        Prima scansione veloce.
+        Light Scanner EODHD.
 
         Cerca titoli con forti movimenti negativi.
-        Non fornisce consigli di acquisto o vendita.
+        Non fornisce consigli finanziari.
         """
-
-        rows: list[dict] = []
-
-        for exchange in exchanges:
-            filters = [
-                [
-                    "exchange",
-                    "=",
-                    str(exchange).lower(),
-                ],
-                [
-                    "refund_1d_p",
-                    "<=",
-                    float(max_return_1d_pct),
-                ],
-                [
-                    "avgvol_1d",
-                    ">=",
-                    int(min_avg_volume),
-                ],
-                [
-                    "adjusted_close",
-                    ">=",
-                    float(min_price),
-                ],
-            ]
-
-            if min_market_cap is not None:
-                filters.append(
-                    [
-                        "market_capitalization",
-                        ">=",
-                        float(min_market_cap),
-                    ]
-                )
-
-            data = self._request(
-                "screener",
-                params={
-                    "filters": json.dumps(
-                        filters,
-                        separators=(",", ":"),
-                    ),
-                    "sort": "refund_1d_p.asc",
-                    "limit": max(
-                        1,
-                        min(
-                            int(limit_per_exchange),
-                            500,
-                        ),
-                    ),
-                    "offset": 0,
-                },
-            )
-
-            if isinstance(data, dict):
-                data = data.get(
-                    "data",
-                    [],
-                )
-
-            if isinstance(data, list):
-                rows.extend(data)
-
-        return pd.DataFrame(rows)
