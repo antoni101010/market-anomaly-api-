@@ -1,6 +1,5 @@
 """
-Layer di servizio: incapsula il motore esistente (scanner, model, catalyst_engine,
-storage) in funzioni pulite, richiamabili da un'API stateless.
+Layer di servizio: collega scanner, provider dati, storage e API.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from config import CONFIG
-from scanner import scan_universe
+from scanner import scan_universe, build_light_universe
 from providers.demo import DemoProvider
 from providers.twelve_data import TwelveDataProvider
 from providers.eodhd import EODHDProvider
@@ -45,7 +44,6 @@ def _market_provider():
         if CONFIG.market_data_provider == "eodhd":
             if not CONFIG.eodhd_api_key:
                 raise RuntimeError(
-                    "MARKET_ANOMALY_PROVIDER=eodhd ma "
                     "EODHD_API_KEY non è impostata sul server."
                 )
 
@@ -57,7 +55,6 @@ def _market_provider():
         if CONFIG.market_data_provider == "twelve_data":
             if not CONFIG.twelve_data_api_key:
                 raise RuntimeError(
-                    "MARKET_ANOMALY_PROVIDER=twelve_data ma "
                     "TWELVE_DATA_API_KEY non è impostata sul server."
                 )
 
@@ -92,21 +89,84 @@ def _row_to_dict(row: pd.Series) -> dict:
     }
 
 
+def _build_live_shortlist(
+    provider,
+    limit: int,
+) -> pd.DataFrame:
+    """
+    Prima fase veloce:
+    usa lo screener EODHD e crea una shortlist reale.
+    """
+
+    shortlist = build_light_universe(
+        market_provider=provider,
+        exchanges=("us",),
+        max_return_1d_pct=-8.0,
+        min_avg_volume=200_000,
+        min_price=2.0,
+        min_market_cap=500_000_000,
+        limit_per_exchange=max(
+            20,
+            min(
+                int(limit),
+                100,
+            ),
+        ),
+    )
+
+    if shortlist is None:
+        raise RuntimeError(
+            "Il provider selezionato non supporta "
+            "il Light Scanner."
+        )
+
+    if shortlist.empty:
+        return shortlist
+
+    shortlist = shortlist.head(
+        int(limit)
+    )
+
+    return shortlist
+
+
 def run_scan(
     limit: int = 40,
     catalyst_top_n: int = 5,
 ) -> dict:
 
-    universe = normalize_universe(
-        build_demo_historical_universe(250)
-    )
-
-    live_u = active_snapshot(
-        universe,
-        pd.Timestamp.today(),
-    ).head(int(limit))
-
     provider = _market_provider()
+
+    if CONFIG.data_mode == "live":
+        live_u = _build_live_shortlist(
+            provider,
+            limit=limit,
+        )
+
+        if live_u.empty:
+            empty = pd.DataFrame()
+            save_latest_scan(
+                empty,
+                market_mode="live",
+            )
+
+            return {
+                "scanned": 0,
+                "valid": 0,
+                "data_mode": "live",
+                "provider": CONFIG.market_data_provider,
+                "light_candidates": 0,
+            }
+
+    else:
+        universe = normalize_universe(
+            build_demo_historical_universe(250)
+        )
+
+        live_u = active_snapshot(
+            universe,
+            pd.Timestamp.today(),
+        ).head(int(limit))
 
     df = scan_universe(
         live_u,
@@ -138,6 +198,9 @@ def run_scan(
             if CONFIG.data_mode == "live"
             else "demo"
         ),
+        "light_candidates": int(
+            len(live_u)
+        ),
     }
 
 
@@ -155,32 +218,43 @@ _scan_lock = threading.Lock()
 _persisted_state = load_scan_state()
 
 if _persisted_state:
-    _scan_state.update(_persisted_state)
+    _scan_state.update(
+        _persisted_state
+    )
 
     if _scan_state["status"] == "running":
         _scan_state.update(
             status="error",
             message=(
-                "La scansione è stata interrotta dal riavvio "
-                "del server. Riprova."
+                "La scansione è stata interrotta "
+                "dal riavvio del server. Riprova."
             ),
             finished_at=datetime.now(
                 timezone.utc
             ).isoformat(),
         )
 
-        save_scan_state(_scan_state)
+        save_scan_state(
+            _scan_state
+        )
 
 
 def get_scan_status() -> dict:
     with _scan_lock:
-        return dict(_scan_state)
+        return dict(
+            _scan_state
+        )
 
 
 def _set_scan_state(**kwargs):
     with _scan_lock:
-        _scan_state.update(kwargs)
-        save_scan_state(_scan_state)
+        _scan_state.update(
+            kwargs
+        )
+
+        save_scan_state(
+            _scan_state
+        )
 
 
 def _run_scan_thread(
@@ -196,7 +270,8 @@ def _run_scan_thread(
         _set_scan_state(
             status="done",
             message=(
-                f"Completata: {result['valid']} titoli validi "
+                f"Completata: "
+                f"{result['valid']} titoli validi "
                 f"su {result['scanned']} analizzati."
             ),
             finished_at=datetime.now(
@@ -238,7 +313,9 @@ def start_scan_background(
             finished_at=None,
         )
 
-        save_scan_state(_scan_state)
+        save_scan_state(
+            _scan_state
+        )
 
     thread = threading.Thread(
         target=_run_scan_thread,
@@ -282,13 +359,16 @@ def get_dashboard(
             },
         }
 
-    df = pd.DataFrame(records)
-
-    valid = (
-        df[df["error"].isna()]
-        if "error" in df.columns
-        else df
+    df = pd.DataFrame(
+        records
     )
+
+    if "error" in df.columns:
+        valid = df[
+            df["error"].isna()
+        ]
+    else:
+        valid = df
 
     candidates = valid[
         (
@@ -304,12 +384,16 @@ def get_dashboard(
     candidates = candidates.sort_values(
         "opportunity_score",
         ascending=False,
-    ).head(int(top_n))
+    ).head(
+        int(top_n)
+    )
 
     top = []
 
     for _, r in candidates.iterrows():
-        d = _row_to_dict(r)
+        d = _row_to_dict(
+            r
+        )
 
         cls = build_ticker_narrative(
             d
@@ -345,8 +429,12 @@ def get_dashboard(
         "market_mode": market_mode,
         "top_anomalies": top,
         "stats": {
-            "analyzed": int(len(valid)),
-            "candidates": int(len(candidates)),
+            "analyzed": int(
+                len(valid)
+            ),
+            "candidates": int(
+                len(candidates)
+            ),
             "max_opportunity": (
                 float(
                     valid[
@@ -406,8 +494,10 @@ def get_ticker_detail(
     return {
         **row,
         "narrative": narrative,
-        "in_watchlist": is_in_watchlist(
-            ticker
+        "in_watchlist": (
+            is_in_watchlist(
+                ticker
+            )
         ),
     }
 
@@ -453,7 +543,8 @@ def add_watchlist_item(
             "Aggiunto alla watchlist."
             if ok
             else (
-                "Il titolo è già in watchlist."
+                "Il titolo è già "
+                "in watchlist."
             )
         ),
     }
