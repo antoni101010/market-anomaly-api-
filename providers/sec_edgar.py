@@ -204,11 +204,8 @@ class SecEdgarProvider:
         units=("shares", "USD"),
     ):
         """
-        Cerca il dato più recente sia nel
-        namespace SEC dei sia in us-gaap.
-
-        EntityCommonStockSharesOutstanding
-        viene normalmente pubblicato in dei.
+        Cerca il dato più recente nei namespace
+        SEC dei e us-gaap.
         """
 
         namespaces = facts.get(
@@ -419,6 +416,9 @@ class SecEdgarProvider:
                     * 100
                 )
 
+        # Prima prova il numero di azioni istantaneo.
+        # Se manca, utilizza le azioni medie diluite
+        # oppure le azioni medie base del bilancio.
         shares = self._latest_value(
             facts,
             [
@@ -428,6 +428,14 @@ class SecEdgarProvider:
                 ),
                 (
                     "CommonStockSharesOutstanding"
+                ),
+                (
+                    "WeightedAverageNumberOf"
+                    "DilutedSharesOutstanding"
+                ),
+                (
+                    "WeightedAverageNumberOf"
+                    "SharesOutstandingBasic"
                 ),
             ],
             units=("shares",),
