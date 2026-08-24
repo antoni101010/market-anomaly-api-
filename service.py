@@ -1,5 +1,6 @@
 """
-Layer di servizio: collega scanner, provider dati, storage e API.
+Layer di servizio:
+collega scanner, provider dati, storage e API.
 """
 
 from __future__ import annotations
@@ -11,9 +12,14 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from config import CONFIG
-from scanner import scan_universe, build_light_universe
+from scanner import (
+    scan_universe,
+    build_light_universe,
+)
 from providers.demo import DemoProvider
-from providers.twelve_data import TwelveDataProvider
+from providers.twelve_data import (
+    TwelveDataProvider,
+)
 from providers.eodhd import EODHDProvider
 
 from universe_manager import (
@@ -35,32 +41,46 @@ from storage import (
     load_scan_state,
 )
 
-from narrative import build_ticker_narrative
+from narrative import (
+    build_ticker_narrative,
+)
 
 
 def _market_provider():
     if CONFIG.data_mode == "live":
 
-        if CONFIG.market_data_provider == "eodhd":
+        if (
+            CONFIG.market_data_provider
+            == "eodhd"
+        ):
             if not CONFIG.eodhd_api_key:
                 raise RuntimeError(
-                    "EODHD_API_KEY non è impostata sul server."
+                    "EODHD_API_KEY non è "
+                    "impostata sul server."
                 )
 
             return EODHDProvider(
                 CONFIG.eodhd_api_key,
-                cache_dir=CONFIG.price_cache_dir,
+                cache_dir=(
+                    CONFIG.price_cache_dir
+                ),
             )
 
-        if CONFIG.market_data_provider == "twelve_data":
+        if (
+            CONFIG.market_data_provider
+            == "twelve_data"
+        ):
             if not CONFIG.twelve_data_api_key:
                 raise RuntimeError(
-                    "TWELVE_DATA_API_KEY non è impostata sul server."
+                    "TWELVE_DATA_API_KEY non è "
+                    "impostata sul server."
                 )
 
             return TwelveDataProvider(
                 CONFIG.twelve_data_api_key,
-                cache_dir=CONFIG.price_cache_dir,
+                cache_dir=(
+                    CONFIG.price_cache_dir
+                ),
             )
 
         raise RuntimeError(
@@ -72,20 +92,31 @@ def _market_provider():
 
 
 def _include_sec() -> bool:
-    return CONFIG.data_mode == "live"
+    return (
+        CONFIG.data_mode
+        == "live"
+    )
 
 
-def _clean_json_value(v):
-    if isinstance(v, float) and math.isnan(v):
+def _clean_json_value(value):
+    if (
+        isinstance(value, float)
+        and math.isnan(value)
+    ):
         return None
-    return v
+
+    return value
 
 
-def _row_to_dict(row: pd.Series) -> dict:
-    d = row.to_dict()
+def _row_to_dict(
+    row: pd.Series,
+) -> dict:
+
+    data = row.to_dict()
+
     return {
-        k: _clean_json_value(v)
-        for k, v in d.items()
+        key: _clean_json_value(value)
+        for key, value in data.items()
     }
 
 
@@ -95,7 +126,9 @@ def _build_live_shortlist(
 ) -> pd.DataFrame:
     """
     Prima fase veloce:
-    usa lo screener EODHD e crea una shortlist reale.
+
+    usa lo screener EODHD e crea
+    una shortlist reale.
     """
 
     shortlist = build_light_universe(
@@ -116,8 +149,8 @@ def _build_live_shortlist(
 
     if shortlist is None:
         raise RuntimeError(
-            "Il provider selezionato non supporta "
-            "il Light Scanner."
+            "Il provider selezionato "
+            "non supporta il Light Scanner."
         )
 
     if shortlist.empty:
@@ -138,13 +171,16 @@ def run_scan(
     provider = _market_provider()
 
     if CONFIG.data_mode == "live":
-        live_u = _build_live_shortlist(
-            provider,
-            limit=limit,
+        live_universe = (
+            _build_live_shortlist(
+                provider,
+                limit=limit,
+            )
         )
 
-        if live_u.empty:
+        if live_universe.empty:
             empty = pd.DataFrame()
+
             save_latest_scan(
                 empty,
                 market_mode="live",
@@ -154,44 +190,60 @@ def run_scan(
                 "scanned": 0,
                 "valid": 0,
                 "data_mode": "live",
-                "provider": CONFIG.market_data_provider,
+                "provider": (
+                    CONFIG.market_data_provider
+                ),
                 "light_candidates": 0,
             }
 
     else:
         universe = normalize_universe(
-            build_demo_historical_universe(250)
+            build_demo_historical_universe(
+                250
+            )
         )
 
-        live_u = active_snapshot(
+        live_universe = active_snapshot(
             universe,
             pd.Timestamp.today(),
-        ).head(int(limit))
+        ).head(
+            int(limit)
+        )
 
-    df = scan_universe(
-        live_u,
+    result = scan_universe(
+        live_universe,
         provider,
         include_sec=_include_sec(),
-        catalyst_top_n=int(catalyst_top_n),
+        catalyst_top_n=int(
+            catalyst_top_n
+        ),
     )
 
     save_latest_scan(
-        df,
+        result,
         market_mode=CONFIG.data_mode,
     )
 
     valid = (
-        df[df["error"].isna()].copy()
-        if "error" in df.columns
-        else df
+        result[
+            result["error"].isna()
+        ].copy()
+        if "error" in result.columns
+        else result
     )
 
     if not valid.empty:
-        save_signals(valid)
+        save_signals(
+            valid
+        )
 
     return {
-        "scanned": int(len(df)),
-        "valid": int(len(valid)),
+        "scanned": int(
+            len(result)
+        ),
+        "valid": int(
+            len(valid)
+        ),
         "data_mode": CONFIG.data_mode,
         "provider": (
             CONFIG.market_data_provider
@@ -199,7 +251,7 @@ def run_scan(
             else "demo"
         ),
         "light_candidates": int(
-            len(live_u)
+            len(live_universe)
         ),
     }
 
@@ -215,19 +267,25 @@ _scan_state = {
 _scan_lock = threading.Lock()
 
 
-_persisted_state = load_scan_state()
+_persisted_state = (
+    load_scan_state()
+)
 
 if _persisted_state:
     _scan_state.update(
         _persisted_state
     )
 
-    if _scan_state["status"] == "running":
+    if (
+        _scan_state["status"]
+        == "running"
+    ):
         _scan_state.update(
             status="error",
             message=(
-                "La scansione è stata interrotta "
-                "dal riavvio del server. Riprova."
+                "La scansione è stata "
+                "interrotta dal riavvio "
+                "del server. Riprova."
             ),
             finished_at=datetime.now(
                 timezone.utc
@@ -264,25 +322,29 @@ def _run_scan_thread(
     try:
         result = run_scan(
             limit=limit,
-            catalyst_top_n=catalyst_top_n,
+            catalyst_top_n=(
+                catalyst_top_n
+            ),
         )
 
         _set_scan_state(
             status="done",
             message=(
                 f"Completata: "
-                f"{result['valid']} titoli validi "
-                f"su {result['scanned']} analizzati."
+                f"{result['valid']} titoli "
+                f"validi su "
+                f"{result['scanned']} "
+                f"analizzati."
             ),
             finished_at=datetime.now(
                 timezone.utc
             ).isoformat(),
         )
 
-    except Exception as e:
+    except Exception as error:
         _set_scan_state(
             status="error",
-            message=str(e),
+            message=str(error),
             finished_at=datetime.now(
                 timezone.utc
             ).isoformat(),
@@ -295,11 +357,15 @@ def start_scan_background(
 ) -> dict:
 
     with _scan_lock:
-        if _scan_state["status"] == "running":
+        if (
+            _scan_state["status"]
+            == "running"
+        ):
             return {
                 "ok": False,
                 "message": (
-                    "Una scansione è già in corso."
+                    "Una scansione è "
+                    "già in corso."
                 ),
             }
 
@@ -331,7 +397,8 @@ def start_scan_background(
     return {
         "ok": True,
         "message": (
-            "Scansione avviata in background."
+            "Scansione avviata "
+            "in background."
         ),
     }
 
@@ -342,9 +409,11 @@ def get_dashboard(
     top_n: int = 20,
 ) -> dict:
 
-    scan_time, market_mode, records = (
-        load_latest_scan()
-    )
+    (
+        scan_time,
+        market_mode,
+        records,
+    ) = load_latest_scan()
 
     if not records:
         return {
@@ -359,16 +428,17 @@ def get_dashboard(
             },
         }
 
-    df = pd.DataFrame(
+    data = pd.DataFrame(
         records
     )
 
-    if "error" in df.columns:
-        valid = df[
-            df["error"].isna()
+    if "error" in data.columns:
+        valid = data[
+            data["error"].isna()
         ]
+
     else:
-        valid = df
+        valid = data
 
     candidates = valid[
         (
@@ -381,46 +451,77 @@ def get_dashboard(
         )
     ].copy()
 
-    candidates = candidates.sort_values(
-        "opportunity_score",
-        ascending=False,
-    ).head(
-        int(top_n)
+    candidates = (
+        candidates.sort_values(
+            "opportunity_score",
+            ascending=False,
+        )
+        .head(
+            int(top_n)
+        )
     )
 
     top = []
 
-    for _, r in candidates.iterrows():
-        d = _row_to_dict(
-            r
+    for _, row in candidates.iterrows():
+        item = _row_to_dict(
+            row
         )
 
-        cls = build_ticker_narrative(
-            d
-        )["classification"]
+        classification = (
+            build_ticker_narrative(
+                item
+            )["classification"]
+        )
 
         top.append({
-            "ticker": d.get("ticker"),
-            "company": d.get("company"),
-            "price": d.get("last_close"),
-            "drawdown_52w_pct": d.get(
+            "ticker": item.get(
+                "ticker"
+            ),
+            "company": item.get(
+                "company"
+            ),
+            "price": item.get(
+                "last_close"
+            ),
+            "drawdown_52w_pct": item.get(
                 "drawdown_52w_pct"
             ),
-            "anomaly_score": d.get(
+            "anomaly_score": item.get(
                 "anomaly_score"
             ),
-            "opportunity_score": d.get(
+            "opportunity_score": item.get(
                 "opportunity_score"
             ),
-            "value_trap_risk": d.get(
+            "value_trap_risk": item.get(
                 "value_trap_risk"
             ),
-            "catalyst_label": d.get(
+            "valuation_score": item.get(
+                "valuation_score"
+            ),
+            "financial_risk_score": item.get(
+                "financial_risk_score"
+            ),
+            "distress_risk_score": item.get(
+                "distress_risk_score"
+            ),
+            "dilution_risk_score": item.get(
+                "dilution_risk_score"
+            ),
+            "confidence_score": item.get(
+                "confidence_score"
+            ),
+            "catalyst_label": item.get(
                 "catalyst_label"
             ),
-            "classification": cls["label"],
+            "classification": (
+                classification["label"]
+            ),
             "in_watchlist": is_in_watchlist(
-                d.get("ticker", "")
+                item.get(
+                    "ticker",
+                    "",
+                )
             ),
         })
 
@@ -470,11 +571,11 @@ def get_ticker_detail(
 
     ticker = ticker.upper()
 
-    match = [
-        r
-        for r in records
+    matches = [
+        record
+        for record in records
         if str(
-            r.get(
+            record.get(
                 "ticker",
                 "",
             )
@@ -482,13 +583,15 @@ def get_ticker_detail(
         == ticker
     ]
 
-    if not match:
+    if not matches:
         return None
 
-    row = match[0]
+    row = matches[0]
 
-    narrative = build_ticker_narrative(
-        row
+    narrative = (
+        build_ticker_narrative(
+            row
+        )
     )
 
     return {
@@ -514,13 +617,13 @@ def add_watchlist_item(
         return {
             "ok": False,
             "message": (
-                f"Nessun dato recente per "
-                f"{ticker.upper()}. "
+                "Nessun dato recente "
+                f"per {ticker.upper()}. "
                 "Esegui prima una scansione."
             ),
         }
 
-    ok = add_to_watchlist(
+    added = add_to_watchlist(
         ticker=ticker,
         company=detail.get(
             "company",
@@ -538,10 +641,10 @@ def add_watchlist_item(
     )
 
     return {
-        "ok": ok,
+        "ok": added,
         "message": (
             "Aggiunto alla watchlist."
-            if ok
+            if added
             else (
                 "Il titolo è già "
                 "in watchlist."
@@ -564,9 +667,9 @@ def remove_watchlist_item(
 
 
 def get_watchlist() -> list[dict]:
-    wl = list_watchlist()
+    watchlist = list_watchlist()
 
-    if wl.empty:
+    if watchlist.empty:
         return []
 
     _, _, records = (
@@ -575,18 +678,20 @@ def get_watchlist() -> list[dict]:
 
     latest_by_ticker = {
         str(
-            r.get(
+            record.get(
                 "ticker",
                 "",
             )
-        ).upper(): r
-        for r in records
+        ).upper(): record
+        for record in records
     }
 
-    out = []
+    output = []
 
-    for _, w in wl.iterrows():
-        ticker = w["ticker"]
+    for _, watched in watchlist.iterrows():
+        ticker = watched[
+            "ticker"
+        ]
 
         latest = latest_by_ticker.get(
             ticker,
@@ -597,18 +702,18 @@ def get_watchlist() -> list[dict]:
             "last_close"
         )
 
-        added_price = w.get(
+        added_price = watched.get(
             "price_at_add"
         )
 
-        perf = None
+        performance = None
 
         if (
             current_price is not None
             and added_price
         ):
             try:
-                perf = round(
+                performance = round(
                     (
                         float(current_price)
                         / float(added_price)
@@ -617,22 +722,29 @@ def get_watchlist() -> list[dict]:
                     * 100,
                     2,
                 )
-            except Exception:
-                perf = None
 
-        out.append({
+            except Exception:
+                performance = None
+
+        output.append({
             "ticker": ticker,
-            "company": w.get(
+            "company": watched.get(
                 "company"
             ),
-            "added_at": w.get(
+            "added_at": watched.get(
                 "added_at"
             ),
-            "price_at_add": added_price,
-            "current_price": current_price,
-            "performance_pct": perf,
+            "price_at_add": (
+                added_price
+            ),
+            "current_price": (
+                current_price
+            ),
+            "performance_pct": (
+                performance
+            ),
             "anomaly_score_at_add": (
-                w.get(
+                watched.get(
                     "anomaly_score_at_add"
                 )
             ),
@@ -642,7 +754,7 @@ def get_watchlist() -> list[dict]:
                 )
             ),
             "opportunity_score_at_add": (
-                w.get(
+                watched.get(
                     "opportunity_score_at_add"
                 )
             ),
@@ -653,21 +765,21 @@ def get_watchlist() -> list[dict]:
             ),
         })
 
-    return out
+    return output
 
 
 def get_history(
     limit: int = 500,
 ) -> list[dict]:
 
-    hist = load_signals(
+    history = load_signals(
         limit=limit
     )
 
-    if hist.empty:
+    if history.empty:
         return []
 
-    cols = [
+    columns = [
         "signal_time",
         "ticker",
         "company",
@@ -680,14 +792,14 @@ def get_history(
         "quality_score",
     ]
 
-    cols = [
-        c
-        for c in cols
-        if c in hist.columns
+    columns = [
+        column
+        for column in columns
+        if column in history.columns
     ]
 
-    return hist[
-        cols
+    return history[
+        columns
     ].to_dict(
         orient="records"
     )
