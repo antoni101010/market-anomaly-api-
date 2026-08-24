@@ -20,7 +20,7 @@ import service
 
 app = FastAPI(
     title="Market Anomaly API",
-    version="1.2",
+    version="1.3",
     description=(
         "Backend per l'app Market Anomaly: "
         "scanner di anomalie post-earnings."
@@ -61,7 +61,7 @@ def trigger_scan(
     _check_api_key(x_api_key)
 
     return service.start_scan_background(
-        limit=limit,
+        limit=min(limit, 40),
         catalyst_top_n=catalyst_top_n,
     )
 
