@@ -1,24 +1,14 @@
 """
-Market Anomaly API — backend REST che espone il motore di analisi all'app Android.
-
-Avvio locale:
-    uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
-
-Avvio produzione (Railway/Render/Docker):
-    uvicorn api.main:app --host 0.0.0.0 --port $PORT
-
-Autenticazione:
-    Ogni richiesta (tranne /health) deve includere l'header:
-        X-API-Key: <valore di MARKET_ANOMALY_API_KEY>
-    Se MARKET_ANOMALY_API_KEY non è impostata sul server, l'autenticazione è
-    disattivata (comodo in sviluppo locale, MAI in produzione).
+Market Anomaly API — backend REST per l'app Android.
 """
 from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Permette a "api/main.py" di importare i moduli del motore nella root del progetto.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parent.parent),
+)
 
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,14 +17,16 @@ from pydantic import BaseModel
 from config import CONFIG
 import service
 
+
 app = FastAPI(
     title="Market Anomaly API",
-    version="1.1",
-    description="Backend per l'app Market Anomaly: scanner di anomalie post-earnings.",
+    version="1.2",
+    description=(
+        "Backend per l'app Market Anomaly: "
+        "scanner di anomalie post-earnings."
+    ),
 )
 
-# In v1 l'unico client è la nostra app Android, ma lasciamo CORS aperto
-# per poter testare da browser/Postman durante lo sviluppo.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,29 +37,39 @@ app.add_middleware(
 
 def _check_api_key(x_api_key: str | None):
     if CONFIG.api_key and x_api_key != CONFIG.api_key:
-        raise HTTPException(status_code=401, detail="API key mancante o non valida.")
+        raise HTTPException(
+            status_code=401,
+            detail="API key mancante o non valida.",
+        )
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": CONFIG.app_name, "data_mode": CONFIG.data_mode}
+    return {
+        "status": "ok",
+        "app": CONFIG.app_name,
+        "data_mode": CONFIG.data_mode,
+    }
 
 
 @app.post("/api/scan")
 def trigger_scan(
-    limit: int = Query(100, ge=10, le=2000),
-    catalyst_top_n: int = Query(7, ge=1, le=25),
+    limit: int = Query(40, ge=10, le=2000),
+    catalyst_top_n: int = Query(5, ge=1, le=25),
     x_api_key: str | None = Header(default=None),
 ):
-    """Avvia una scansione in BACKGROUND e ritorna subito (non blocca).
-    L'app deve poi interrogare /api/scan/status per sapere quando è finita."""
     _check_api_key(x_api_key)
-    result = service.start_scan_background(limit=limit, catalyst_top_n=catalyst_top_n)
-    return result
+
+    return service.start_scan_background(
+        limit=limit,
+        catalyst_top_n=catalyst_top_n,
+    )
 
 
 @app.get("/api/scan/status")
-def scan_status(x_api_key: str | None = Header(default=None)):
+def scan_status(
+    x_api_key: str | None = Header(default=None),
+):
     _check_api_key(x_api_key)
     return service.get_scan_status()
 
@@ -80,15 +82,29 @@ def dashboard(
     x_api_key: str | None = Header(default=None),
 ):
     _check_api_key(x_api_key)
-    return service.get_dashboard(min_opportunity, max_value_trap, top_n)
+
+    return service.get_dashboard(
+        min_opportunity,
+        max_value_trap,
+        top_n,
+    )
 
 
 @app.get("/api/ticker/{ticker}")
-def ticker_detail(ticker: str, x_api_key: str | None = Header(default=None)):
+def ticker_detail(
+    ticker: str,
+    x_api_key: str | None = Header(default=None),
+):
     _check_api_key(x_api_key)
+
     detail = service.get_ticker_detail(ticker)
+
     if detail is None:
-        raise HTTPException(status_code=404, detail=f"Nessun dato recente per {ticker.upper()}.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Nessun dato recente per {ticker.upper()}.",
+        )
+
     return detail
 
 
@@ -97,24 +113,35 @@ class WatchlistAddRequest(BaseModel):
 
 
 @app.get("/api/watchlist")
-def watchlist(x_api_key: str | None = Header(default=None)):
+def watchlist(
+    x_api_key: str | None = Header(default=None),
+):
     _check_api_key(x_api_key)
     return service.get_watchlist()
 
 
 @app.post("/api/watchlist")
-def watchlist_add(body: WatchlistAddRequest, x_api_key: str | None = Header(default=None)):
+def watchlist_add(
+    body: WatchlistAddRequest,
+    x_api_key: str | None = Header(default=None),
+):
     _check_api_key(x_api_key)
     return service.add_watchlist_item(body.ticker)
 
 
 @app.delete("/api/watchlist/{ticker}")
-def watchlist_remove(ticker: str, x_api_key: str | None = Header(default=None)):
+def watchlist_remove(
+    ticker: str,
+    x_api_key: str | None = Header(default=None),
+):
     _check_api_key(x_api_key)
     return service.remove_watchlist_item(ticker)
 
 
 @app.get("/api/history")
-def history(limit: int = Query(500, ge=1, le=5000), x_api_key: str | None = Header(default=None)):
+def history(
+    limit: int = Query(500, ge=1, le=5000),
+    x_api_key: str | None = Header(default=None),
+):
     _check_api_key(x_api_key)
     return service.get_history(limit=limit)
