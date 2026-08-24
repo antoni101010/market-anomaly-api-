@@ -42,11 +42,12 @@ from storage import (
 from narrative import build_ticker_narrative
 
 
-# Universo reale temporaneo usato solamente
-# quando il piano EODHD blocca lo Screener.
+# Universo reale temporaneo usato quando:
+# - lo Screener EODHD restituisce HTTP 403;
+# - lo Screener non restituisce candidati.
 #
-# Permette di continuare lo sviluppo con dati reali,
-# ma non sostituisce la futura scansione globale.
+# Serve per continuare lo sviluppo con dati reali.
+# Non sostituisce la futura scansione globale.
 FALLBACK_LIVE_UNIVERSE = [
     {
         "ticker": "AAPL.US",
@@ -160,6 +161,24 @@ def _row_to_dict(row: pd.Series) -> dict:
     }
 
 
+def _fallback_shortlist(
+    reason: str,
+) -> pd.DataFrame:
+    shortlist = pd.DataFrame(
+        FALLBACK_LIVE_UNIVERSE
+    )
+
+    shortlist[
+        "light_scanner_mode"
+    ] = "fallback_without_screener"
+
+    shortlist[
+        "light_scanner_note"
+    ] = reason
+
+    return shortlist
+
+
 def _build_live_shortlist(
     provider,
     limit: int,
@@ -167,9 +186,9 @@ def _build_live_shortlist(
     """
     Prova prima lo Screener EODHD.
 
-    Se il piano restituisce HTTP 403,
-    utilizza un universo reale ridotto
-    per permettere lo sviluppo dell'app.
+    Se il piano restituisce HTTP 403 oppure
+    non vengono trovati candidati, utilizza
+    un universo reale ridotto.
     """
 
     try:
@@ -193,17 +212,7 @@ def _build_live_shortlist(
         if "HTTP 403" not in str(error):
             raise
 
-        shortlist = pd.DataFrame(
-            FALLBACK_LIVE_UNIVERSE
-        )
-
-        shortlist[
-            "light_scanner_mode"
-        ] = "fallback_without_screener"
-
-        shortlist[
-            "light_scanner_note"
-        ] = (
+        shortlist = _fallback_shortlist(
             "Screener EODHD non incluso nel "
             "piano: universo reale ridotto "
             "utilizzato per lo sviluppo."
@@ -213,6 +222,16 @@ def _build_live_shortlist(
         raise RuntimeError(
             "Il provider selezionato non "
             "supporta il Light Scanner."
+        )
+
+    if (
+        shortlist.empty
+        and CONFIG.data_mode == "live"
+    ):
+        shortlist = _fallback_shortlist(
+            "Lo Screener EODHD non ha restituito "
+            "candidati: universo reale ridotto "
+            "utilizzato per lo sviluppo."
         )
 
     if shortlist.empty:
@@ -788,15 +807,9 @@ def get_watchlist() -> list[dict]:
             "added_at": watched.get(
                 "added_at"
             ),
-            "price_at_add": (
-                added_price
-            ),
-            "current_price": (
-                current_price
-            ),
-            "performance_pct": (
-                performance
-            ),
+            "price_at_add": added_price,
+            "current_price": current_price,
+            "performance_pct": performance,
             "anomaly_score_at_add": (
                 watched.get(
                     "anomaly_score_at_add"
