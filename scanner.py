@@ -1,353 +1,820 @@
-import re
-from datetime import datetime, timezone
+import math
+import pandas as pd
 
-
-STRUCTURAL_NEGATIVE = {
-    "fraud": 35,
-    "accounting": 30,
-    "restatement": 35,
-    "material weakness": 25,
-    "bankruptcy": 45,
-    "default": 40,
-    "liquidity": 30,
-    "covenant": 30,
-    "subpoena": 30,
-    "investigation": 28,
-    "criminal": 40,
-    "sec investigation": 38,
-    "antitrust": 22,
-    "regulatory": 20,
-    "lawsuit": 16,
-    "litigation": 16,
-    "data breach": 22,
-    "cybersecurity incident": 22,
-    "impairment": 18,
-    "going concern": 45,
-    "delisting": 40,
-    "auditor resignation": 38,
-}
-
-
-TEMPORARY_NEGATIVE = {
-    "lowered guidance": 18,
-    "cuts guidance": 18,
-    "guidance cut": 18,
-    "misses estimates": 14,
-    "missed estimates": 14,
-    "revenue miss": 14,
-    "earnings miss": 14,
-    "weak demand": 12,
-    "inventory": 10,
-    "restructuring": 10,
-    "one-time charge": 8,
-    "foreign exchange": 6,
-    "currency headwind": 6,
-    "macro": 8,
-    "slowdown": 10,
-    "delay": 8,
-}
-
-
-POSITIVE = {
-    "raises guidance": -18,
-    "raised guidance": -18,
-    "beats estimates": -14,
-    "beat estimates": -14,
-    "share repurchase": -12,
-    "buyback": -12,
-    "authorization": -5,
-    "dividend increase": -8,
-    "contract award": -10,
-    "approval": -10,
-    "record revenue": -10,
-    "record earnings": -10,
-}
-
-
-EARNINGS_WORDS = (
-    "earnings",
-    "quarter",
-    "quarterly",
-    "results",
-    "revenue",
-    "eps",
-    "guidance",
-    "outlook",
-    "margin",
+from indicators import (
+    rsi14,
+    drawdown_52w_pct,
+    volume_ratio_20d,
+    return_pct,
+    volatility_20d_pct,
+    worst_day_20d_pct,
+)
+from fundamentals import (
+    enrich_fundamental_scores,
+    value_trap_risk,
+)
+from providers.sec_edgar import SecEdgarProvider
+from catalyst_engine import (
+    classify_catalysts,
+    opportunity_score,
+)
+from model import (
+    technical_components,
+    live_score,
 )
 
 
-def _blob(items):
-    chunks = []
+def clamp(x, lo=0, hi=100):
+    try:
+        if math.isnan(float(x)):
+            return 0.0
 
-    for item in items or []:
-        title = str(
-            item.get("title")
-            or item.get("headline")
-            or ""
+        return max(
+            lo,
+            min(
+                hi,
+                float(x),
+            ),
         )
 
-        text = str(
-            item.get("text")
-            or item.get("summary")
-            or item.get("description")
-            or ""
-        )
-
-        chunks.append(
-            (title + " " + text).lower()
-        )
-
-    return "\n".join(chunks)
+    except Exception:
+        return 0.0
 
 
-def classify_catalysts(
-    items,
-    filings=None,
-):
-    text = _blob(items)
-
-    hits_struct = []
-    hits_temp = []
-    hits_pos = []
-
-    risk = 45.0
-
-    for phrase, weight in STRUCTURAL_NEGATIVE.items():
-        if phrase in text:
-            hits_struct.append(phrase)
-            risk += weight
-
-    for phrase, weight in TEMPORARY_NEGATIVE.items():
-        if phrase in text:
-            hits_temp.append(phrase)
-            risk += weight
-
-    for phrase, weight in POSITIVE.items():
-        if phrase in text:
-            hits_pos.append(phrase)
-            risk += weight
-
-    earnings_related = any(
-        word in text
-        for word in EARNINGS_WORDS
-    )
-
-    filing_forms = [
-        str(item.get("form", ""))
-        for item in (filings or [])
-    ]
-
-    if "8-K" in filing_forms and not text:
-        risk += 4
-
-    if any(
-        form in filing_forms
-        for form in ("10-Q", "10-K")
-    ):
-        earnings_related = True
-
-    if hits_struct:
-        label = (
-            "Possibile rischio strutturale"
-        )
-
-    elif hits_temp and not hits_pos:
-        label = (
-            "Catalizzatore negativo "
-            "potenzialmente temporaneo"
-        )
-
-    elif hits_pos and not hits_temp:
-        label = (
-            "Catalizzatore prevalentemente "
-            "positivo"
-        )
-
-    elif hits_temp and hits_pos:
-        label = "Catalizzatori misti"
-
-    elif items:
-        label = "Causa non classificata"
-
-    elif filings:
-        label = "Solo filing SEC rilevati"
-
-    else:
-        label = (
-            "Nessun catalizzatore disponibile"
-        )
-
-    risk = max(
-        0.0,
-        min(
-            100.0,
-            risk,
-        ),
-    )
-
-    explanations = []
-
-    if hits_struct:
-        explanations.append(
-            "rischi strutturali: "
-            + ", ".join(
-                sorted(
-                    set(hits_struct)
-                )[:5]
-            )
-        )
-
-    if hits_temp:
-        explanations.append(
-            "fattori temporanei/operativi: "
-            + ", ".join(
-                sorted(
-                    set(hits_temp)
-                )[:5]
-            )
-        )
-
-    if hits_pos:
-        explanations.append(
-            "fattori positivi: "
-            + ", ".join(
-                sorted(
-                    set(hits_pos)
-                )[:5]
-            )
-        )
-
-    if earnings_related:
-        explanations.append(
-            "contenuto collegato a "
-            "risultati/guidance"
-        )
-
+def base_technical(prices):
     return {
-        "catalyst_label": label,
-        "catalyst_risk": round(
-            risk,
-            1,
+        "drawdown_52w_pct": drawdown_52w_pct(
+            prices
         ),
-        "earnings_related": bool(
-            earnings_related
+        "rsi14": rsi14(
+            prices["close"]
         ),
-        "structural_hits": ", ".join(
-            sorted(
-                set(hits_struct)
-            )
+        "volume_ratio_20d": volume_ratio_20d(
+            prices
         ),
-        "temporary_hits": ", ".join(
-            sorted(
-                set(hits_temp)
-            )
+        "return_20d_pct": return_pct(
+            prices["close"],
+            20,
         ),
-        "positive_hits": ", ".join(
-            sorted(
-                set(hits_pos)
-            )
+        "return_60d_pct": return_pct(
+            prices["close"],
+            60,
         ),
-        "catalyst_explanation": (
-            "; ".join(explanations)
-            if explanations
-            else (
-                "Nessuna causa forte "
-                "identificata automaticamente."
-            )
+        "volatility_20d_pct": volatility_20d_pct(
+            prices["close"]
         ),
-        "catalyst_items": items or [],
-        "recent_filings": filings or [],
+        "worst_day_20d_pct": worst_day_20d_pct(
+            prices["close"]
+        ),
+        "last_close": float(
+            prices["close"].iloc[-1]
+        ),
     }
 
 
-def opportunity_score(
-    anomaly_score,
-    quality_score,
-    value_trap_risk,
-    catalyst_risk,
-    valuation_score=50,
-    financial_risk=50,
-    distress_risk=50,
-    dilution_risk=50,
-    confidence_score=100,
+def score_one(
+    technical,
+    quality,
+    spy60,
+    sector60,
 ):
-    """
-    Sintesi analitica.
-
-    Non rappresenta una probabilità,
-    una previsione di rendimento o un
-    consiglio di investimento.
-
-    Un forte ribasso da solo non basta.
-
-    Una valutazione ancora elevata,
-    la fragilità finanziaria e i dati
-    incompleti riducono esplicitamente
-    il punteggio.
-    """
-
-    score = (
-        float(anomaly_score) * 0.28
-        + float(quality_score) * 0.12
-        + float(valuation_score) * 0.17
-        + (
-            100
-            - float(value_trap_risk)
-        )
-        * 0.14
-        + (
-            100
-            - float(catalyst_risk)
-        )
-        * 0.10
-        + (
-            100
-            - float(financial_risk)
-        )
-        * 0.07
-        + (
-            100
-            - float(distress_risk)
-        )
-        * 0.06
-        + (
-            100
-            - float(dilution_risk)
-        )
-        * 0.03
+    components = technical_components(
+        technical,
+        spy60,
+        sector60,
     )
 
-    # Confidence non aumenta artificialmente
-    # il punteggio.
-    #
-    # Quando mancano dati importanti,
-    # limita quanto il motore può dichiararsi
-    # convinto dell'anomalia.
-    confidence = max(
-        0.0,
-        min(
-            100.0,
-            float(confidence_score),
+    anomaly = live_score(
+        components,
+        quality,
+    )
+
+    return {
+        "anomaly_score": round(
+            anomaly,
+            1,
         ),
-    )
+        "score_drawdown": round(
+            components["score_drawdown"],
+            1,
+        ),
+        "score_rsi": round(
+            components["score_rsi"],
+            1,
+        ),
+        "score_volume": round(
+            components["score_volume"],
+            1,
+        ),
+        "score_momentum": round(
+            components["score_momentum"],
+            1,
+        ),
+        "score_shock": round(
+            components["score_shock"],
+            1,
+        ),
+        "score_market_relative": round(
+            components[
+                "score_market_relative"
+            ],
+            1,
+        ),
+        "score_sector_relative": round(
+            components[
+                "score_sector_relative"
+            ],
+            1,
+        ),
+        "relative_60d_vs_spy_pct": round(
+            components[
+                "relative_60d_vs_spy_pct"
+            ],
+            2,
+        ),
+        "relative_60d_vs_sector_pct": round(
+            components[
+                "relative_60d_vs_sector_pct"
+            ],
+            2,
+        ),
+    }
 
-    score *= (
-        0.55
-        + (
-            confidence
-            / 100.0
+
+def recovery_potential(
+    anomaly,
+    quality,
+    trap,
+    rel_sector,
+):
+    score = (
+        anomaly * 0.48
+        + quality * 0.27
+        + max(
+            0,
+            100 - trap,
         )
-        * 0.45
+        * 0.20
+        + clamp(
+            abs(
+                min(
+                    rel_sector,
+                    0,
+                )
+            )
+            * 1.2
+        )
+        * 0.05
     )
 
     return round(
-        max(
-            0.0,
-            min(
-                100.0,
-                score,
-            ),
-        ),
+        clamp(score),
         1,
+    )
+
+
+def explanation(row):
+    reasons = []
+
+    if row["drawdown_52w_pct"] <= -30:
+        reasons.append(
+            "forte distanza dal massimo annuale"
+        )
+
+    if row["relative_60d_vs_spy_pct"] <= -12:
+        reasons.append(
+            "forte sottoperformance rispetto al mercato"
+        )
+
+    if (
+        row[
+            "relative_60d_vs_sector_pct"
+        ]
+        <= -10
+    ):
+        reasons.append(
+            "forte sottoperformance rispetto al settore"
+        )
+
+    if row["volume_ratio_20d"] >= 1.8:
+        reasons.append(
+            "volumi insolitamente elevati"
+        )
+
+    if row["rsi14"] <= 32:
+        reasons.append(
+            "pressione di vendita molto elevata"
+        )
+
+    if row["quality_score"] >= 70:
+        reasons.append(
+            "qualità fondamentale elevata"
+        )
+
+    if row["value_trap_risk"] >= 70:
+        reasons.append(
+            "rischio elevato che il calo sia giustificato"
+        )
+
+    elif row["value_trap_risk"] <= 40:
+        reasons.append(
+            "rischio relativamente contenuto "
+            "che il deterioramento sia strutturale"
+        )
+
+    detail = (
+        ", ".join(reasons)
+        if reasons
+        else (
+            "movimento insolito, ma senza "
+            "un fattore quantitativo dominante"
+        )
+    )
+
+    return (
+        "Il motore ha rilevato: "
+        + detail
+        + "."
+    )
+
+
+def build_light_universe(
+    market_provider,
+    exchanges=("us",),
+    max_return_1d_pct=-8.0,
+    min_avg_volume=200_000,
+    min_price=2.0,
+    min_market_cap=500_000_000,
+    limit_per_exchange=100,
+):
+    """
+    LIGHT SCANNER.
+
+    Usa lo screener del provider per individuare
+    rapidamente solo i titoli che hanno avuto
+    movimenti fortemente negativi.
+
+    Non assegna ancora il punteggio finale.
+    Serve solo a creare la shortlist da passare
+    all'analisi approfondita.
+    """
+
+    if not hasattr(
+        market_provider,
+        "screen_candidates",
+    ):
+        return None
+
+    candidates = (
+        market_provider.screen_candidates(
+            exchanges=exchanges,
+            max_return_1d_pct=(
+                max_return_1d_pct
+            ),
+            min_avg_volume=min_avg_volume,
+            min_price=min_price,
+            min_market_cap=min_market_cap,
+            limit_per_exchange=(
+                limit_per_exchange
+            ),
+        )
+    )
+
+    if (
+        candidates is None
+        or candidates.empty
+    ):
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "company",
+                "sector_etf",
+            ]
+        )
+
+    rows = []
+
+    for _, item in candidates.iterrows():
+        ticker = str(
+            item.get(
+                "code",
+                "",
+            )
+        ).strip().upper()
+
+        if not ticker:
+            continue
+
+        company = str(
+            item.get(
+                "name",
+                ticker,
+            )
+        ).strip()
+
+        exchange = str(
+            item.get(
+                "exchange",
+                "US",
+            )
+        ).strip().upper()
+
+        api_ticker = (
+            ticker
+            if "." in ticker
+            else f"{ticker}.{exchange}"
+        )
+
+        rows.append({
+            "ticker": api_ticker,
+            "display_ticker": ticker,
+            "company": company,
+            "sector_etf": "SPY",
+            "light_return_1d_pct": item.get(
+                "refund_1d_p"
+            ),
+            "light_last_price": item.get(
+                "adjusted_close"
+            ),
+            "light_market_cap": item.get(
+                "market_capitalization"
+            ),
+            "light_volume": item.get(
+                "avgvol_1d"
+            ),
+            "light_sector": item.get(
+                "sector"
+            ),
+            "light_industry": item.get(
+                "industry"
+            ),
+            "light_exchange": exchange,
+        })
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+def scan_universe(
+    universe,
+    market_provider,
+    include_sec=False,
+    catalyst_top_n=5,
+):
+    sec = (
+        SecEdgarProvider()
+        if include_sec
+        else None
+    )
+
+    symbols = list(
+        universe["ticker"]
+        .astype(str)
+        .str.upper()
+    )
+
+    sectors = list(
+        universe["sector_etf"]
+        .astype(str)
+        .str.upper()
+        .unique()
+    )
+
+    needed = sorted(
+        set(
+            symbols
+            + sectors
+            + ["SPY"]
+        )
+    )
+
+    histories = {}
+    batch_attempted = False
+
+    if hasattr(
+        market_provider,
+        "batch_daily_history",
+    ):
+        batch_attempted = True
+
+        try:
+            histories = (
+                market_provider.batch_daily_history(
+                    needed,
+                    outputsize=300,
+                )
+            )
+
+        except Exception:
+            histories = {}
+
+    def get_hist(symbol):
+        if symbol in histories:
+            return histories[symbol]
+
+        if batch_attempted:
+            raise RuntimeError(
+                "Dati non disponibili nel "
+                f"batch per {symbol}"
+            )
+
+        history = (
+            market_provider.daily_history(
+                symbol,
+                outputsize=300,
+            )
+        )
+
+        histories[symbol] = history
+
+        return history
+
+    try:
+        spy60 = base_technical(
+            get_hist("SPY")
+        )["return_60d_pct"]
+
+    except Exception:
+        try:
+            spy60 = base_technical(
+                get_hist("SPY.US")
+            )["return_60d_pct"]
+
+        except Exception:
+            spy60 = 0.0
+
+    sector60 = {}
+
+    for sector in sectors:
+        try:
+            sector60[sector] = (
+                base_technical(
+                    get_hist(sector)
+                )["return_60d_pct"]
+            )
+
+        except Exception:
+            sector60[sector] = spy60
+
+    rows = []
+
+    for _, item in universe.iterrows():
+        ticker = str(
+            item["ticker"]
+        ).upper()
+
+        company = str(
+            item["company"]
+        )
+
+        sector = str(
+            item["sector_etf"]
+        ).upper()
+
+        display_ticker = str(
+            item.get(
+                "display_ticker",
+                ticker.split(".")[0],
+            )
+        ).upper()
+
+        try:
+            prices = get_hist(
+                ticker
+            )
+
+            if len(prices) < 65:
+                raise ValueError(
+                    "Storico insufficiente: "
+                    "servono almeno 65 sedute."
+                )
+
+            technical = base_technical(
+                prices
+            )
+
+            metrics = {
+                "revenue_growth_pct": None,
+                "net_margin_pct": None,
+                "liabilities_to_assets": None,
+                "fcf_margin_pct": None,
+                "approx_pe": None,
+                "approx_ps": None,
+            }
+
+            # DEEP ENGINE:
+            # recupera i fondamentali solamente
+            # dopo che il Light Scanner ha creato
+            # la shortlist.
+            if hasattr(
+                market_provider,
+                "fundamentals",
+            ):
+                try:
+                    metrics.update(
+                        market_provider.fundamentals(
+                            ticker
+                        )
+                    )
+
+                except Exception as error:
+                    metrics[
+                        "fundamentals_error"
+                    ] = str(error)
+
+            # SEC viene usato come integrazione.
+            # Non deve sovrascrivere i dati EODHD
+            # già disponibili.
+            if include_sec and sec is not None:
+                sec_ticker = display_ticker
+
+                try:
+                    sec_metrics = sec.metrics(
+                        sec_ticker,
+                        technical["last_close"],
+                    )
+
+                    for key, value in (
+                        sec_metrics.items()
+                    ):
+                        if metrics.get(key) is None:
+                            metrics[key] = value
+
+                except Exception:
+                    pass
+
+            else:
+                if (
+                    "demo_revenue_growth"
+                    in item.index
+                ):
+                    metrics.update({
+                        "revenue_growth_pct": float(
+                            item[
+                                "demo_revenue_growth"
+                            ]
+                        ),
+                        "net_margin_pct": float(
+                            item[
+                                "demo_net_margin"
+                            ]
+                        ),
+                        "liabilities_to_assets": float(
+                            item[
+                                "demo_liab_assets"
+                            ]
+                        ),
+                        "fcf_margin_pct": float(
+                            item[
+                                "demo_fcf_margin"
+                            ]
+                        ),
+                    })
+
+            # Calcola tutti i nuovi punteggi:
+            # Quality, Valuation, Financial Risk,
+            # Dilution Risk, Distress Risk
+            # e Confidence.
+            metrics = (
+                enrich_fundamental_scores(
+                    metrics
+                )
+            )
+
+            quality = metrics[
+                "quality_score"
+            ]
+
+            trap = value_trap_risk(
+                metrics,
+                technical,
+            )
+
+            metrics[
+                "value_trap_risk"
+            ] = trap
+
+            scores = score_one(
+                technical,
+                quality,
+                spy60,
+                sector60.get(
+                    sector,
+                    spy60,
+                ),
+            )
+
+            recovery = recovery_potential(
+                scores["anomaly_score"],
+                quality,
+                trap,
+                scores[
+                    "relative_60d_vs_sector_pct"
+                ],
+            )
+
+            row = {
+                "ticker": display_ticker,
+                "provider_ticker": ticker,
+                "company": company,
+                "sector_etf": sector,
+                **technical,
+                **metrics,
+                **scores,
+                "value_trap_risk": round(
+                    trap,
+                    1,
+                ),
+                "recovery_potential": recovery,
+                "catalyst_label": (
+                    "Non analizzato"
+                ),
+                "catalyst_risk": 50.0,
+                "earnings_related": False,
+                "catalyst_explanation": (
+                    "Catalyst engine non "
+                    "ancora eseguito."
+                ),
+                "catalyst_items": [],
+                "recent_filings": [],
+                "error": None,
+            }
+
+            for field in [
+                "light_return_1d_pct",
+                "light_last_price",
+                "light_market_cap",
+                "light_volume",
+                "light_sector",
+                "light_industry",
+                "light_exchange",
+            ]:
+                if field in item.index:
+                    row[field] = item.get(
+                        field
+                    )
+
+            row["explanation"] = (
+                explanation(row)
+            )
+
+            rows.append(
+                row
+            )
+
+        except Exception as error:
+            rows.append({
+                "ticker": display_ticker,
+                "provider_ticker": ticker,
+                "company": company,
+                "sector_etf": sector,
+                "error": str(error),
+            })
+
+    df = pd.DataFrame(
+        rows
+    )
+
+    if (
+        df.empty
+        or "anomaly_score"
+        not in df.columns
+    ):
+        return df
+
+    valid_idx = (
+        df[
+            df["error"].isna()
+        ]
+        .sort_values(
+            "anomaly_score",
+            ascending=False,
+        )
+        .head(
+            int(catalyst_top_n)
+        )
+        .index
+    )
+
+    for index in valid_idx:
+        ticker = df.at[
+            index,
+            "ticker",
+        ]
+
+        provider_ticker = df.at[
+            index,
+            "provider_ticker",
+        ]
+
+        releases = []
+        filings = []
+
+        try:
+            if hasattr(
+                market_provider,
+                "press_releases",
+            ):
+                releases = (
+                    market_provider.press_releases(
+                        provider_ticker,
+                        limit=8,
+                    )
+                )
+
+        except Exception:
+            releases = []
+
+        if include_sec and sec is not None:
+            try:
+                filings = (
+                    sec.recent_filings(
+                        ticker,
+                        limit=8,
+                    )
+                )
+
+            except Exception:
+                filings = []
+
+        catalyst = classify_catalysts(
+            releases,
+            filings,
+        )
+
+        for key, value in catalyst.items():
+            df.at[
+                index,
+                key,
+            ] = value
+
+    opportunities = []
+
+    for _, row in df.iterrows():
+        error = row.get(
+            "error"
+        )
+
+        if (
+            error is not None
+            and not pd.isna(error)
+        ):
+            opportunities.append(
+                None
+            )
+            continue
+
+        opportunities.append(
+            opportunity_score(
+                row[
+                    "anomaly_score"
+                ],
+                row[
+                    "quality_score"
+                ],
+                row[
+                    "value_trap_risk"
+                ],
+                row[
+                    "catalyst_risk"
+                ],
+                valuation_score=row.get(
+                    "valuation_score",
+                    50,
+                ),
+                financial_risk=row.get(
+                    "financial_risk_score",
+                    50,
+                ),
+                distress_risk=row.get(
+                    "distress_risk_score",
+                    50,
+                ),
+                dilution_risk=row.get(
+                    "dilution_risk_score",
+                    50,
+                ),
+                confidence_score=row.get(
+                    "confidence_score",
+                    0,
+                ),
+            )
+        )
+
+    df["opportunity_score"] = (
+        opportunities
+    )
+
+    df = df.sort_values(
+        [
+            "opportunity_score",
+            "anomaly_score",
+        ],
+        ascending=False,
+        na_position="last",
+    )
+
+    return df.reset_index(
+        drop=True
     )
