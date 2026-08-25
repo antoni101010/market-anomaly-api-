@@ -18,6 +18,7 @@ class TwelveDataProvider:
         timeout=25,
         batch_size=8,
         cache_dir="data/price_cache",
+        cache_ttl_minutes=30,
     ):
         self.api_key = api_key
         self.timeout = timeout
@@ -26,6 +27,8 @@ class TwelveDataProvider:
             min(int(batch_size), 8),
         )
         self.cache = {}
+        self.cache_times = {}
+        self.cache_ttl_seconds = max(60, int(cache_ttl_minutes) * 60)
         self.session = requests.Session()
 
         retry = Retry(
@@ -100,6 +103,9 @@ class TwelveDataProvider:
         )
 
         if not path or not path.exists():
+            return None
+
+        if time.time() - path.stat().st_mtime > self.cache_ttl_seconds:
             return None
 
         try:
@@ -281,7 +287,10 @@ class TwelveDataProvider:
             str(adjust),
         )
 
-        if key in self.cache:
+        if (
+            key in self.cache
+            and time.time() - self.cache_times.get(key, 0) <= self.cache_ttl_seconds
+        ):
             return self.cache[key].copy()
 
         disk = self._load_disk(
@@ -292,6 +301,7 @@ class TwelveDataProvider:
 
         if disk is not None:
             self.cache[key] = disk
+            self.cache_times[key] = time.time()
             return disk.copy()
 
         response = self._get_with_429_retry(
@@ -313,6 +323,7 @@ class TwelveDataProvider:
         )
 
         self.cache[key] = df
+        self.cache_times[key] = time.time()
 
         self._save_disk(
             symbol,
@@ -348,7 +359,10 @@ class TwelveDataProvider:
                 str(adjust),
             )
 
-            if key in self.cache:
+            if (
+                key in self.cache
+                and time.time() - self.cache_times.get(key, 0) <= self.cache_ttl_seconds
+            ):
                 result[symbol] = (
                     self.cache[key].copy()
                 )
@@ -362,6 +376,7 @@ class TwelveDataProvider:
 
             if disk is not None:
                 self.cache[key] = disk
+                self.cache_times[key] = time.time()
                 result[symbol] = disk.copy()
             else:
                 missing.append(symbol)
@@ -441,6 +456,7 @@ class TwelveDataProvider:
                     )
 
                     self.cache[key] = df
+                    self.cache_times[key] = time.time()
                     result[symbol] = df.copy()
 
                     self._save_disk(
@@ -454,6 +470,37 @@ class TwelveDataProvider:
                     continue
 
         return result
+
+    def latest_quote(self, symbol):
+        response = self._get_with_429_retry(
+            f"{self.BASE}/quote",
+            params={
+                "symbol": str(symbol).upper(),
+                "apikey": self.api_key,
+            },
+            timeout=self.timeout,
+            max_attempts=1,
+        )
+        data = response.json()
+        if not isinstance(data, dict) or data.get("status") == "error":
+            raise RuntimeError(
+                data.get("message", "Quota Twelve Data non disponibile")
+                if isinstance(data, dict)
+                else "Quota Twelve Data non valida"
+            )
+        try:
+            price = float(data.get("close") or data.get("price"))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("Prezzo Twelve Data non disponibile") from error
+        return {
+            "price": price,
+            "previous_close": data.get("previous_close"),
+            "change_pct": data.get("percent_change"),
+            "observed_at": data.get("datetime"),
+            "source": "twelve_data_live_or_delayed",
+            "provider_ticker": str(symbol).upper(),
+            "is_delayed": True,
+        }
 
     def press_releases(
         self,

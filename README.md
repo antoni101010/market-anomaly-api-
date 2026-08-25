@@ -1,82 +1,58 @@
-# Market Anomaly v1.0
+# Market Anomaly API 2.1
 
-Versione completa del motore di ricerca delle anomalie di mercato.
+Backend FastAPI real-data-only per l'app Android Market Anomaly.
 
-## Funzioni incluse
-
-### Live scanner
-- Anomaly Score 0–100
-- Opportunity Score 0–100
-- Recovery Potential
-- Quality Score
-- Value Trap Risk
-- Catalyst Risk
-- confronto con SPY e settore
-- drawdown, RSI, volume relativo, momentum e shock
-
-### Catalyst engine
-Analizza comunicati societari e filing SEC recenti per distinguere segnali potenzialmente temporanei da rischi strutturali.
-
-### Fondamentali
-SEC EDGAR per società USA, con modalità point-in-time nel backtest.
-
-### Backtest serio
-- universo storico dinamico
-- titoli delistati
-- terminal delisting return quando disponibile
-- prezzi adjusted
-- commissioni e slippage
-- top-N + cooldown
-- confronto con SPY
-
-### Statistica
-- bootstrap dell'excess return
-- intervallo di confidenza 95%
-- sign-flip permutation test
-- analisi per settore
-- analisi bull/bear/neutral
-- correzione FDR Benjamini-Hochberg
-- curva cohort e max drawdown
-
-### Robustezza
-- train/holdout
-- walk-forward
-- stabilità dei pesi
-- Bias Audit A–E
-
-### Prodotto
-- storico segnali in SQLite
-- regole alert
-- export CSV
-- Dockerfile
-- cache dati
-- configurazione tramite variabili ambiente
-
-## Avvio rapido
+## Avvio
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-streamlit run app.py
+uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
-Per provare tutto senza costi seleziona **Demo**.
+Copia i valori di `.env.example` nelle variabili d'ambiente del server. Sono
+obbligatorie `MARKET_ANOMALY_DATA_MODE=live`, `EODHD_API_KEY`,
+`MARKET_ANOMALY_API_KEY` e un `SEC_USER_AGENT` identificabile.
 
-## Dati reali
+Su Render monta un disco in `/var/data` e usa:
 
-### Twelve Data
-Usato per serie storiche/live e comunicati societari. L'app usa batch e cache locale.
+```text
+MARKET_ANOMALY_DB=/var/data/market_anomaly.db
+MARKET_ANOMALY_PRICE_CACHE_DIR=/var/data/price_cache
+MARKET_ANOMALY_BACKUP_DIR=/var/data/backups
+```
 
-### SEC EDGAR
-Usato per fondamentali e filing. Imposta:
+## Endpoint principali
+
+| Metodo | Endpoint | Funzione |
+|---|---|---|
+| GET | `/health` | versione e stato server |
+| POST | `/api/scan` | avvia Light + Deep scanner |
+| GET | `/api/scan/status` | stato scansione background |
+| GET | `/api/dashboard` | risultati con filtri personali |
+| GET | `/api/ticker/{ticker}` | dettaglio, prezzo e narrativa |
+| GET | `/api/ticker/{ticker}/prices` | grafico multi-periodo |
+| GET | `/api/search` | ricerca globale provider |
+| POST | `/api/analyze` | analisi manuale titolo |
+| GET/POST/DELETE | `/api/watchlist` | titoli seguiti |
+| GET | `/api/history` | storico segnali |
+| POST | `/api/feedback` | utile / possibile falso segnale |
+| GET | `/api/learning` | esiti aggregati per orizzonte |
+| POST | `/api/outcomes/update` | aggiorna esiti maturati |
+| GET | `/api/diagnostics` | prezzi, storage e scanner |
+
+Tranne `/health`, gli endpoint richiedono l'header `X-API-Key` quando
+`MARKET_ANOMALY_API_KEY` è configurata.
+
+## Test
 
 ```bash
-export SEC_USER_AGENT="MarketAnomaly tua-email@example.com"
+python -m py_compile *.py providers/*.py api/*.py
+python release_verification.py
+pytest -q
 ```
 
-### Alpha Vantage
-Opzionale per metadata di listing/delisting dell'universo storico.
-
-## Nota commerciale
-La v1.0 è il motore applicativo completo, ma per vendere il servizio servono comunque contratti dati, hosting, login, pagamenti e revisione legale/compliance. Questi sono servizi esterni al motore di analisi.
-
-Vedi `COMMERCIAL_CHECKLIST.md`.
+Il workflow GitHub `Verifica backend` esegue gli stessi controlli a ogni push.
+I file demo/backtest restano esclusivamente come dataset di ricerca offline;
+l'API di produzione rifiuta `MARKET_ANOMALY_DATA_MODE` diverso da `live`.

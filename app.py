@@ -23,7 +23,7 @@ from alerts import evaluate_alerts
 
 st.set_page_config(page_title=CONFIG.app_name,page_icon="📉",layout="wide")
 st.title(CONFIG.app_name)
-st.caption("v1.0 — scanner di anomalie, catalyst engine, backtest point-in-time e validazione statistica")
+st.caption("v2.2 — ricerca statistica su anomalie, eventi, backtest point-in-time e validazione")
 
 for k in ["live_results","bt_dataset","bt_signals","opt_result","wf_result","bt_params","alpha_universe","custom_universe"]:
     if k not in st.session_state: st.session_state[k]=None
@@ -39,7 +39,7 @@ with st.sidebar:
     st.header("Scanner live")
     live_limit=st.slider("Titoli",10,1000,100,10)
     catalyst_top_n=st.slider("Catalyst sui migliori",1,25,7)
-    min_live=st.slider("Opportunity minimo",0,100,55)
+    min_live=st.slider("Somiglianza storica minima",0,100,55)
     max_trap=st.slider("Value Trap massimo",0,100,65)
     run_live=st.button("Scansiona ora",type="primary",use_container_width=True)
 
@@ -88,10 +88,10 @@ with tabs[0]:
         candidates=valid[(valid['opportunity_score']>=min_live)&(valid['value_trap_risk']<=max_trap)].copy()
         a,b,c,d=st.columns(4)
         a.metric("Analizzati",len(valid)); b.metric("Candidati",len(candidates))
-        c.metric("Opportunity max",f"{valid['opportunity_score'].max():.1f}" if len(valid) else "-")
+        c.metric("Somiglianza storica max",f"{valid['opportunity_score'].max():.1f}" if len(valid) else "-")
         d.metric("Anomaly max",f"{valid['anomaly_score'].max():.1f}" if len(valid) else "-")
         if len(candidates):
-            st.dataframe(candidates[["ticker","company","opportunity_score","anomaly_score","value_trap_risk","catalyst_risk","quality_score","catalyst_label"]].head(20),use_container_width=True,hide_index=True)
+            st.dataframe(candidates[["ticker","company","opportunity_score","anomaly_score","value_trap_risk","catalyst_risk","quality_score","catalyst_label"]].head(20).rename(columns={"opportunity_score":"somiglianza_casi_storici"}),use_container_width=True,hide_index=True)
             hits=evaluate_alerts(valid)
             if not hits.empty: st.success(f"{len(hits)} alert attivi scattati.")
 
@@ -102,12 +102,12 @@ with tabs[1]:
     else:
         valid=df[df['error'].isna()].copy()
         filt=valid[(valid['opportunity_score']>=min_live)&(valid['value_trap_risk']<=max_trap)].copy()
-        st.dataframe(filt[["ticker","company","opportunity_score","anomaly_score","recovery_potential","value_trap_risk","catalyst_risk","quality_score","drawdown_52w_pct","relative_60d_vs_spy_pct"]],use_container_width=True,hide_index=True)
+        st.dataframe(filt[["ticker","company","opportunity_score","anomaly_score","recovery_potential","value_trap_risk","catalyst_risk","quality_score","drawdown_52w_pct","relative_60d_vs_spy_pct"]].rename(columns={"opportunity_score":"somiglianza_casi_storici","recovery_potential":"pattern_recupero_storico"}),use_container_width=True,hide_index=True)
         if len(filt):
             tic=st.selectbox("Scheda",filt['ticker'].tolist(),key="scan_ticker")
             r=filt[filt.ticker==tic].iloc[0]
             a,b,c,d=st.columns(4)
-            a.metric("Opportunity",f"{r.opportunity_score:.1f}/100"); b.metric("Anomaly",f"{r.anomaly_score:.1f}/100")
+            a.metric("Casi storici",f"{r.opportunity_score:.1f}/100"); b.metric("Anomaly",f"{r.anomaly_score:.1f}/100")
             c.metric("Value Trap",f"{r.value_trap_risk:.1f}/100"); d.metric("Catalyst Risk",f"{r.catalyst_risk:.1f}/100")
             st.write(r.explanation); st.info(f"{r.catalyst_label}: {r.catalyst_explanation}")
             if st.button("Salva candidati",key="save_live"): st.success(f"Salvati {save_signals(filt)} segnali")
@@ -207,7 +207,7 @@ with tabs[7]:
     with st.form("new_alert"):
         name=st.text_input("Nome regola",value="Top anomaly")
         a,b,c,d=st.columns(4)
-        mo=a.number_input("Opportunity ≥",0,100,75); ma=b.number_input("Anomaly ≥",0,100,60); vt=c.number_input("Value Trap ≤",0,100,50); cr=d.number_input("Catalyst Risk ≤",0,100,60)
+        mo=a.number_input("Somiglianza storica ≥",0,100,75); ma=b.number_input("Anomaly ≥",0,100,60); vt=c.number_input("Value Trap ≤",0,100,50); cr=d.number_input("Catalyst Risk ≤",0,100,60)
         if st.form_submit_button("Salva regola"):
             add_alert_rule(name,mo,ma,vt,cr); st.success("Regola salvata")
     rules=list_alert_rules(); st.dataframe(rules,use_container_width=True,hide_index=True)
@@ -224,19 +224,12 @@ with tabs[8]:
 with tabs[9]:
     st.subheader("Setup commerciale")
     st.markdown("""
-La v1.0 contiene il **motore completo del prodotto**. Per venderla pubblicamente servono ancora servizi esterni, non logica di trading aggiuntiva:
+La v2.2 include il livello legale nell'app mobile, la metodologia, la tracciatura versionata dell'accettazione e il Global Market Tension Engine. Prima di una vendita pubblica restano da verificare gli elementi esterni al codice: licenza commerciale dei dati, hosting/dominio, eventuale autenticazione e pagamenti e revisione professionale del modello commerciale concreto.
 
-- contratto/licenza dati che consenta il tuo uso commerciale e il tipo di display scelto;
-- hosting HTTPS e dominio;
-- autenticazione utenti;
-- pagamenti/abbonamenti;
-- privacy policy, termini e revisione legale del posizionamento finanziario;
-- monitoraggio, backup e supporto.
-
-Il prodotto è progettato come **scanner/ricerca**, non come consulenza personalizzata. Evita messaggi come “compra questo titolo” o portafogli personalizzati senza verificare gli obblighi regolamentari applicabili.
+Il prodotto è progettato come **strumento di ricerca statistica**. Non determina l'adeguatezza di uno strumento per una persona, non gestisce portafogli, non esegue ordini e non formula istruzioni personalizzate di acquisto o vendita.
 """)
     st.code("streamlit run app.py")
     st.caption("Per SEC imposta SEC_USER_AGENT con nome progetto + email di contatto reale.")
 
 st.divider()
-st.caption("Market Anomaly v1.0 — ricerca quantitativa. I risultati storici non garantiscono risultati futuri e non costituiscono consulenza finanziaria.")
+st.caption("Market Anomaly v2.2 — ricerca statistica. Dati e risultati storici possono essere incompleti o ritardati e non garantiscono risultati futuri.")

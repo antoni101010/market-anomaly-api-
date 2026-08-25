@@ -56,9 +56,30 @@ def backtest_score(row, weights=None):
 
 def live_score(components, quality_score, weights=None):
     w=weights or LIVE_WEIGHTS
-    return clamp(
-        components["score_drawdown"]*w["drawdown"]+components["score_rsi"]*w["rsi"]+
-        components["score_volume"]*w["volume"]+components["score_momentum"]*w["momentum"]+
-        components["score_shock"]*w["shock"]+components["score_market_relative"]*w["market_relative"]+
-        components["score_sector_relative"]*w["sector_relative"]+clamp(quality_score)*w.get("quality",0)
+    technical = (
+        ("score_drawdown", "drawdown"),
+        ("score_rsi", "rsi"),
+        ("score_volume", "volume"),
+        ("score_momentum", "momentum"),
+        ("score_shock", "shock"),
+        ("score_market_relative", "market_relative"),
+        ("score_sector_relative", "sector_relative"),
     )
+    weighted = sum(clamp(components[value_key]) * w[weight_key]
+                   for value_key, weight_key in technical)
+    total_weight = sum(w[weight_key] for _, weight_key in technical)
+
+    # La qualità mancante non diventa né 50 né 0: viene semplicemente esclusa.
+    # La completezza limita separatamente l'Opportunity tramite Confidence.
+    try:
+        quality = float(quality_score)
+        quality_available = math.isfinite(quality)
+    except (TypeError, ValueError):
+        quality_available = False
+        quality = 0.0
+
+    if quality_available and w.get("quality", 0) > 0:
+        weighted += clamp(quality) * w["quality"]
+        total_weight += w["quality"]
+
+    return clamp(weighted / total_weight if total_weight else 0.0)

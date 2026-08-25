@@ -1,469 +1,239 @@
-"""
-Genera le spiegazioni testuali per la scheda
-di dettaglio del titolo:
-
-- Perché potrebbe essere un'anomalia
-- Perché potrebbe non esserlo
-- Classificazione dell'Opportunity Score
-
-Il modulo traduce i risultati del motore
-in un linguaggio semplice e comprensibile.
-
-Non genera consigli di acquisto o vendita.
-"""
+"""Testi sintetici, specifici e prudenti per dashboard e dettaglio titolo."""
 
 from __future__ import annotations
 
+import math
 
-DEFAULT_THRESHOLDS = {
-    "exceptional": 90,
-    "strong": 80,
-    "interesting": 70,
-    "watch": 60,
+
+DEFAULT_THRESHOLDS = {"strong": 75, "possible": 60, "review": 45}
+
+FIELD_LABELS = {
+    "pe_ratio": "P/E",
+    "forward_pe": "P/E forward",
+    "price_to_sales": "prezzo/ricavi",
+    "price_to_book": "prezzo/patrimonio",
+    "ev_to_ebitda": "EV/EBITDA",
+    "fcf_yield_pct": "rendimento del free cash flow",
+    "revenue_growth_pct": "crescita dei ricavi",
+    "net_margin_pct": "margine netto",
+    "fcf_margin_pct": "margine del free cash flow",
+    "liabilities_to_assets": "passività/attivi",
+    "debt_to_ebitda": "debito/EBITDA",
+    "current_ratio": "liquidità corrente",
+    "interest_coverage": "copertura degli interessi",
+    "shares_outstanding_growth_pct": "variazione delle azioni in circolazione",
+    "market_cap": "capitalizzazione",
 }
 
 
+def _number(value):
+    try:
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _missing_fields(row: dict) -> list[str]:
+    raw = row.get("missing_fundamental_fields") or []
+    if isinstance(raw, str):
+        raw = [item.strip() for item in raw.split(",") if item.strip()]
+    return [FIELD_LABELS.get(str(item), str(item).replace("_", " ")) for item in raw]
+
+
+def data_gaps(row: dict) -> list[str]:
+    """Elenca dati assenti o non affidabili senza usare frasi generiche."""
+    gaps = []
+    price_status = str(row.get("price_status") or row.get("price_validation") or "")
+    if price_status in {"conflict", "provider_conflict"}:
+        gaps.append("prezzo recente non coerente con lo storico")
+    elif price_status in {"stale", "unknown"}:
+        gaps.append("prezzo recente non verificato")
+
+    missing = _missing_fields(row)
+    if missing:
+        preview = ", ".join(missing[:4])
+        if len(missing) > 4:
+            preview += f" e altri {len(missing) - 4} dati"
+        gaps.append(preview)
+
+    if row.get("catalyst_label") in {
+        "Non analizzato",
+        "Nessun catalizzatore disponibile",
+    }:
+        gaps.append("causa del movimento non identificata")
+    return gaps
+
+
 def classify_opportunity(
-    score: float,
+    score: float | None,
     thresholds: dict | None = None,
+    row: dict | None = None,
 ) -> dict:
+    t = thresholds or DEFAULT_THRESHOLDS
+    value = _number(score) or 0.0
+    row = row or {}
+    confidence = _number(row.get("confidence_score"))
+    price_status = str(row.get("price_status") or row.get("price_validation") or "")
 
-    limits = (
-        thresholds
-        or DEFAULT_THRESHOLDS
-    )
-
-    score = (
-        float(score)
-        if score is not None
-        else 0.0
-    )
-
-    if score >= limits["exceptional"]:
-        label = "ANOMALIA ECCEZIONALE"
-        key = "exceptional"
-
-    elif score >= limits["strong"]:
-        label = "ANOMALIA FORTE"
-        key = "strong"
-
-    elif score >= limits["interesting"]:
-        label = "POSSIBILE ANOMALIA"
-        key = "interesting"
-
-    elif score >= limits["watch"]:
-        label = "DA APPROFONDIRE"
-        key = "watch"
-
+    if price_status in {"conflict", "provider_conflict"}:
+        label, key = "PREZZO DA VERIFICARE", "warning"
+    elif confidence is None or confidence < 25:
+        label, key = "DATI INSUFFICIENTI", "insufficient"
+    elif value >= t["strong"]:
+        label, key = "SOMIGLIANZA STORICA ALTA", "strong"
+    elif value >= t["possible"]:
+        label, key = "SOMIGLIANZA STORICA MODERATA", "possible"
+    elif value >= t["review"]:
+        label, key = "SOMIGLIANZA STORICA LIMITATA", "review"
     else:
-        label = "MOVIMENTO NON PRIORITARIO"
-        key = "low"
-
-    return {
-        "label": label,
-        "key": key,
-        "score": score,
-    }
+        label, key = "SOMIGLIANZA STORICA BASSA", "low"
+    return {"label": label, "key": key, "score": round(value, 1)}
 
 
-def why_it_might_be_anomaly(
-    row: dict,
-) -> list[str]:
-    """
-    Elementi che possono indicare
-    una reazione eccessiva del mercato.
-    """
+def _sector_context(row: dict) -> str | None:
+    sector = " ".join(filter(None, [
+        str(row.get("light_sector") or row.get("sector") or ""),
+        str(row.get("light_industry") or row.get("industry") or ""),
+    ])).lower()
+    if any(word in sector for word in ("bank", "financial", "insurance")):
+        return "Per banche e assicurazioni il P/E da solo è poco informativo: contano soprattutto patrimonio, qualità del credito e capitale regolamentare."
+    if any(word in sector for word in ("reit", "real estate")):
+        return "Per i REIT utili contabili e P/E possono distorcere il confronto: FFO, debito e copertura delle distribuzioni sono più indicativi."
+    if any(word in sector for word in ("biotech", "biotechnology")):
+        return "Per una biotech pre-ricavi il valore dipende soprattutto da cassa disponibile, sperimentazioni e rischio di diluizione."
+    if any(word in sector for word in ("software", "saas")):
+        return "Per il software ricorrente vanno letti insieme crescita, margini, retention e generazione di cassa; il prezzo/ricavi isolato non basta."
+    if any(word in sector for word in ("mining", "metals", "gold", "oil", "energy")):
+        return "Per le società legate alle materie prime utili e multipli cambiano con il ciclo: debito e costo di produzione aiutano a distinguere il ciclo dal deterioramento."
+    return None
 
+
+def why_it_might_be_anomaly(row: dict) -> list[str]:
     reasons = []
+    dd = _number(row.get("drawdown_52w_pct"))
+    rel_market = _number(row.get("relative_60d_vs_spy_pct"))
+    rel_sector = _number(row.get("relative_60d_vs_sector_pct"))
+    volume = _number(row.get("volume_ratio_20d"))
+    rsi = _number(row.get("rsi14"))
+    worst = _number(row.get("worst_day_20d_pct"))
+    quality = _number(row.get("quality_score"))
+    valuation = _number(row.get("valuation_score"))
 
-    drawdown = row.get(
-        "drawdown_52w_pct"
-    )
-
-    if (
-        drawdown is not None
-        and drawdown <= -25
-    ):
+    if dd is not None and dd <= -15:
+        intensity = "molto ampio" if dd <= -35 else "significativo"
         reasons.append(
-            f"Il titolo ha perso circa "
-            f"{abs(drawdown):.0f}% dal massimo "
-            "delle ultime 52 settimane. "
-            "Un calo di questa entità segnala "
-            "un movimento particolarmente forte."
+            f"Il ribasso dal massimo a 52 settimane è {abs(dd):.1f}%: un movimento {intensity} rispetto alla storia recente."
         )
-
-    relative_market = row.get(
-        "relative_60d_vs_spy_pct"
-    )
-
-    if (
-        relative_market is not None
-        and relative_market <= -12
-    ):
+    if rel_market is not None and rel_market <= -8:
         reasons.append(
-            "Negli ultimi 60 giorni il titolo "
-            f"ha fatto circa "
-            f"{abs(relative_market):.0f} punti "
-            "percentuali peggio del mercato. "
-            "Il movimento non dipende solamente "
-            "dall'andamento generale."
+            f"In 60 sedute ha sottoperformato il benchmark di {abs(rel_market):.1f} punti percentuali: il calo non è spiegato soltanto dal mercato."
         )
-
-    relative_sector = row.get(
-        "relative_60d_vs_sector_pct"
-    )
-
-    if (
-        relative_sector is not None
-        and relative_sector <= -10
-    ):
+    if rel_sector is not None and rel_sector <= -8:
         reasons.append(
-            "Il titolo ha avuto una performance "
-            "molto peggiore rispetto alle altre "
-            "società dello stesso settore."
+            f"Rispetto al riferimento settoriale è indietro di {abs(rel_sector):.1f} punti in 60 sedute, quindi il movimento è anche specifico dell'azienda."
         )
-
-    volume = row.get(
-        "volume_ratio_20d"
-    )
-
-    if (
-        volume is not None
-        and volume >= 1.8
-    ):
-        reasons.append(
-            "I volumi di scambio sono molto "
-            "più alti del normale. Molti "
-            "investitori hanno reagito nello "
-            "stesso momento."
-        )
-
-    rsi = row.get("rsi14")
-
-    if (
-        rsi is not None
-        and rsi <= 32
-    ):
-        reasons.append(
-            "La pressione di vendita è stata "
-            "molto elevata e rapida rispetto "
-            "alla storia recente del titolo."
-        )
-
-    quality = row.get(
-        "quality_score"
-    )
-
-    if (
-        quality is not None
-        and quality >= 65
-    ):
-        reasons.append(
-            "I fondamentali disponibili "
-            "risultano relativamente solidi "
-            f"(qualità stimata "
-            f"{quality:.0f}/100)."
-        )
-
-    valuation = row.get(
-        "valuation_score"
-    )
-
-    if (
-        valuation is not None
-        and valuation >= 65
-    ):
-        reasons.append(
-            "Dopo il ribasso, la valutazione "
-            "risulta relativamente contenuta "
-            f"rispetto ai dati disponibili "
-            f"({valuation:.0f}/100)."
-        )
-
-    catalyst_label = row.get(
-        "catalyst_label"
-    )
-
-    if (
-        catalyst_label
-        == (
-            "Catalizzatore negativo "
-            "potenzialmente temporaneo"
-        )
-    ):
-        reasons.append(
-            "L'evento scatenante individuato "
-            "sembra avere natura temporanea "
-            "oppure operativa, anziché "
-            "strutturale."
-        )
-
+    if volume is not None and volume >= 1.5:
+        reasons.append(f"Il volume è {volume:.1f} volte la media a 20 sedute, segnale di partecipazione anomala al movimento.")
+    if rsi is not None and rsi <= 32:
+        reasons.append(f"L'RSI a 14 sedute è {rsi:.0f}, compatibile con una fase di vendita particolarmente intensa.")
+    if worst is not None and worst <= -7:
+        reasons.append(f"La peggiore seduta recente ha segnato {worst:.1f}%, evidenziando uno shock concentrato.")
+    if quality is not None and quality >= 65:
+        reasons.append(f"Sui dati disponibili, la qualità fondamentale è {quality:.0f}/100 e non mostra fragilità evidente nel solo quadro numerico.")
+    if valuation is not None and valuation >= 65:
+        reasons.append(f"La valutazione relativa ottiene {valuation:.0f}/100 sui multipli effettivamente disponibili.")
     if not reasons:
-        reasons.append(
-            "Il motore ha individuato una "
-            "combinazione di elementi insoliti, "
-            "ma nessun singolo fattore risulta "
-            "dominante."
-        )
-
+        reasons.append("Il movimento supera i filtri tecnici minimi, ma non presenta ancora un fattore dominante.")
     return reasons
 
 
-def why_it_might_not_be(
-    row: dict,
-) -> list[str]:
-    """
-    Elementi di cautela e motivi per cui
-    il ribasso potrebbe essere giustificato.
-    """
-
+def why_it_might_not_be(row: dict) -> list[str]:
     risks = []
+    trap = _number(row.get("value_trap_risk"))
+    valuation = _number(row.get("valuation_score"))
+    confidence = _number(row.get("confidence_score"))
+    financial = _number(row.get("financial_risk_score"))
+    distress = _number(row.get("distress_risk_score"))
+    dilution = _number(row.get("dilution_risk_score"))
+    pe = _number(row.get("pe_ratio") or row.get("approx_pe"))
+    ps = _number(row.get("price_to_sales") or row.get("approx_ps"))
+    revenue_growth = _number(row.get("revenue_growth_pct"))
 
-    value_trap = row.get(
-        "value_trap_risk"
-    )
+    if trap is not None and trap >= 65:
+        risks.append(f"Il rischio value trap è {trap:.0f}/100: il deterioramento osservato potrebbe essere strutturale.")
+    if valuation is not None and valuation < 40:
+        measures = []
+        if pe is not None:
+            measures.append(f"P/E {pe:.1f}x")
+        if ps is not None:
+            measures.append(f"prezzo/ricavi {ps:.1f}x")
+        detail = f" ({', '.join(measures)})" if measures else ""
+        risks.append(f"La valutazione è debole, {valuation:.0f}/100{detail}: il ribasso non ha ancora prodotto multipli favorevoli nel modello.")
+    if financial is not None and financial >= 60:
+        risks.append(f"Il rischio finanziario è elevato ({financial:.0f}/100) sui dati di debito e liquidità disponibili.")
+    if distress is not None and distress >= 60:
+        risks.append(f"Il rischio di deterioramento è elevato ({distress:.0f}/100).")
+    if dilution is not None and dilution >= 60:
+        risks.append(f"Il rischio di diluizione è elevato ({dilution:.0f}/100).")
+    if revenue_growth is not None and revenue_growth < 0:
+        risks.append(f"I ricavi risultano in contrazione del {abs(revenue_growth):.1f}%: il mercato potrebbe stare prezzando un problema operativo reale.")
 
-    if (
-        value_trap is not None
-        and value_trap >= 65
-    ):
-        risks.append(
-            "Il rischio di value trap è "
-            f"elevato ({value_trap:.0f}/100). "
-            "Il ribasso potrebbe riflettere "
-            "problemi reali e persistenti."
-        )
+    gaps = data_gaps(row)
+    if gaps:
+        risks.append("La lettura è parziale perché mancano o vanno verificati: " + "; ".join(gaps) + ".")
+    elif confidence is not None and confidence < 55:
+        risks.append(f"L'affidabilità è {confidence:.0f}/100: il segnale non supera ancora una soglia di robustezza elevata.")
 
-    valuation = row.get(
-        "valuation_score"
-    )
+    catalyst = str(row.get("catalyst_label") or "")
+    catalyst_risk = _number(row.get("catalyst_risk"))
+    if catalyst == "Possibile rischio strutturale":
+        risks.append("Le comunicazioni analizzate contengono indicatori di possibile rischio strutturale; serve una verifica dei documenti originali.")
+    elif catalyst_risk is not None and catalyst_risk >= 60:
+        risks.append(f"Il rischio associato all'evento è {catalyst_risk:.0f}/100.")
 
-    if (
-        valuation is not None
-        and valuation < 40
-    ):
-        risks.append(
-            "Nonostante il ribasso, la "
-            "valutazione risulta ancora elevata "
-            f"({valuation:.0f}/100). "
-            "Il fatto che il prezzo sia sceso "
-            "non significa automaticamente che "
-            "il titolo sia diventato economico."
-        )
-
-    financial_risk = row.get(
-        "financial_risk_score"
-    )
-
-    if (
-        financial_risk is not None
-        and financial_risk >= 65
-    ):
-        risks.append(
-            "Il rischio finanziario risulta "
-            f"elevato ({financial_risk:.0f}/100)."
-        )
-
-    distress_risk = row.get(
-        "distress_risk_score"
-    )
-
-    if (
-        distress_risk is not None
-        and distress_risk >= 65
-    ):
-        risks.append(
-            "Il rischio di difficoltà "
-            "finanziaria risulta elevato "
-            f"({distress_risk:.0f}/100)."
-        )
-
-    dilution_risk = row.get(
-        "dilution_risk_score"
-    )
-
-    if (
-        dilution_risk is not None
-        and dilution_risk >= 65
-    ):
-        risks.append(
-            "Il rischio di emissione di nuove "
-            "azioni e conseguente diluizione "
-            f"risulta elevato "
-            f"({dilution_risk:.0f}/100)."
-        )
-
-    confidence = row.get(
-        "confidence_score"
-    )
-
-    if (
-        confidence is not None
-        and confidence < 55
-    ):
-        risks.append(
-            "L'analisi è incompleta "
-            f"(affidabilità "
-            f"{confidence:.0f}/100). "
-            "Mancano alcuni dati necessari "
-            "per una valutazione robusta."
-        )
-
-    catalyst_label = row.get(
-        "catalyst_label"
-    )
-
-    catalyst_risk = row.get(
-        "catalyst_risk"
-    )
-
-    if (
-        catalyst_label
-        == "Possibile rischio strutturale"
-    ):
-        risks.append(
-            "Il motore ha rilevato elementi "
-            "associati a possibili rischi "
-            "strutturali, come problemi di "
-            "bilancio, liquidità, indagini "
-            "oppure rischio di delisting."
-        )
-
-    elif (
-        catalyst_risk is not None
-        and catalyst_risk >= 60
-    ):
-        risks.append(
-            "Il rischio legato all'evento "
-            "scatenante è elevato "
-            f"({catalyst_risk:.0f}/100)."
-        )
-
-    quality = row.get(
-        "quality_score"
-    )
-
-    if (
-        quality is not None
-        and quality < 45
-    ):
-        risks.append(
-            "I fondamentali disponibili "
-            "risultano deboli "
-            f"(qualità stimata "
-            f"{quality:.0f}/100). "
-            "Il ribasso potrebbe quindi "
-            "essere almeno in parte giustificato."
-        )
-
-    liabilities = row.get(
-        "liabilities_to_assets"
-    )
-
-    if (
-        liabilities is not None
-        and liabilities >= 0.7
-    ):
-        risks.append(
-            "Il livello delle passività "
-            "rispetto agli attivi è elevato. "
-            "Questo aumenta il rischio in caso "
-            "di ulteriore peggioramento."
-        )
-
-    revenue_growth = row.get(
-        "revenue_growth_pct"
-    )
-
-    if (
-        revenue_growth is not None
-        and revenue_growth < 0
-    ):
-        risks.append(
-            "La crescita dei ricavi risulta "
-            f"negativa ({revenue_growth:.1f}%). "
-            "Il dato indica un possibile "
-            "deterioramento del business."
-        )
-
-    eps_growth = row.get(
-        "eps_growth_pct"
-    )
-
-    if (
-        eps_growth is not None
-        and eps_growth < 0
-    ):
-        risks.append(
-            "La crescita degli utili risulta "
-            f"negativa ({eps_growth:.1f}%)."
-        )
-
-    fcf_margin = row.get(
-        "fcf_margin_pct"
-    )
-
-    if (
-        fcf_margin is not None
-        and fcf_margin < 0
-    ):
-        risks.append(
-            "Il flusso di cassa libero è "
-            "negativo rispetto ai ricavi. "
-            "L'azienda sta assorbendo cassa."
-        )
-
-    if row.get("fundamentals_error"):
-        risks.append(
-            "Non è stato possibile recuperare "
-            "tutti i dati fondamentali dal "
-            "provider. L'analisi deve essere "
-            "considerata incompleta."
-        )
-
-    if row.get("error"):
-        risks.append(
-            "Sono presenti dati incompleti "
-            "oppure un errore nell'analisi "
-            "di questo titolo."
-        )
-
+    context = _sector_context(row)
+    if context:
+        risks.append(context)
     if not risks:
-        risks.append(
-            "Dai dati disponibili non emergono "
-            "rischi strutturali evidenti. "
-            "Questo non esclude eventi o rischi "
-            "che il modello non può rilevare."
-        )
-
+        risks.append("I dati disponibili non evidenziano una criticità dominante; restano possibili eventi non ancora riflessi nelle fonti del modello.")
     return risks
 
 
-def build_ticker_narrative(
-    row: dict,
-    thresholds: dict | None = None,
-) -> dict:
+def _summary(row: dict, classification: dict) -> str:
+    dd = _number(row.get("drawdown_52w_pct"))
+    anomaly = _number(row.get("anomaly_score"))
+    valuation = _number(row.get("valuation_score"))
+    confidence = _number(row.get("confidence_score"))
+    gaps = data_gaps(row)
 
-    classification = (
-        classify_opportunity(
-            row.get(
-                "opportunity_score",
-                0,
-            ),
-            thresholds,
-        )
+    movement = f"Ribasso di {abs(dd):.1f}% dal massimo" if dd is not None else "Movimento rilevato"
+    if classification["key"] == "warning":
+        return f"{movement}, ma la quota recente è incoerente: il prezzo va verificato prima di interpretare i punteggi."
+    if classification["key"] == "insufficient":
+        missing = gaps[0] if gaps else "dati fondamentali e contestuali"
+        return f"{movement}; non classificabile in modo robusto finché non sono disponibili {missing}."
+    if gaps and confidence is not None and confidence < 55:
+        return f"{movement}; segnale tecnico {anomaly or 0:.0f}/100, ma l’affidabilità statistica resta limitata dai dati mancanti."
+    if valuation is not None and valuation < 40:
+        return f"{movement}; l'anomalia tecnica è accompagnata da un quadro valutativo relativo debole ({valuation:.0f}/100)."
+    if classification["key"] in {"strong", "possible"}:
+        return f"{movement}; il quadro corrente presenta una somiglianza statistica significativa con casi storici del dataset."
+    return f"{movement}; la somiglianza statistica con i casi storici del dataset rimane contenuta."
+
+
+def build_ticker_narrative(row: dict, thresholds: dict | None = None) -> dict:
+    classification = classify_opportunity(
+        row.get("opportunity_score"),
+        thresholds,
+        row=row,
     )
-
     return {
         "classification": classification,
-        "why_anomaly": (
-            why_it_might_be_anomaly(
-                row
-            )
-        ),
-        "why_not": (
-            why_it_might_not_be(
-                row
-            )
-        ),
+        "summary": _summary(row, classification),
+        "why_anomaly": why_it_might_be_anomaly(row),
+        "why_not": why_it_might_not_be(row),
+        "data_gaps": data_gaps(row),
+        "sector_context": _sector_context(row),
+        "informational_only": True,
     }
