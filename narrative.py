@@ -23,6 +23,7 @@ FIELD_LABELS = {
     "interest_coverage": "copertura degli interessi",
     "shares_outstanding_growth_pct": "variazione delle azioni in circolazione",
     "market_cap": "capitalizzazione",
+    "cash_runway_months": "autonomia di cassa",
 }
 
 
@@ -38,7 +39,14 @@ def _missing_fields(row: dict) -> list[str]:
     raw = row.get("missing_fundamental_fields") or []
     if isinstance(raw, str):
         raw = [item.strip() for item in raw.split(",") if item.strip()]
-    return [FIELD_LABELS.get(str(item), str(item).replace("_", " ")) for item in raw]
+    status = str(row.get("cash_runway_status") or "")
+    cleaned = []
+    for item in raw:
+        field = str(item)
+        if field == "cash_runway_months" and status == "not_applicable_positive_fcf":
+            continue
+        cleaned.append(FIELD_LABELS.get(field, field.replace("_", " ")))
+    return cleaned
 
 
 def data_gaps(row: dict) -> list[str]:

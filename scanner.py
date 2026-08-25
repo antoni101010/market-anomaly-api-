@@ -39,6 +39,80 @@ def clamp(x, lo=0, hi=100):
         return 0.0
 
 
+def overall_confidence(row: dict) -> float:
+    """Coverage of fundamentals + price freshness + event context.
+
+    This intentionally prevents a 100/100 label when the catalyst layer was
+    not run or the quote/fundamentals are stale.
+    """
+    fundamental = row.get("fundamental_confidence_score", row.get("confidence_score"))
+    try:
+        fundamental = float(fundamental)
+        if not math.isfinite(fundamental):
+            fundamental = 0.0
+    except (TypeError, ValueError):
+        fundamental = 0.0
+
+    validation = str(row.get("price_validation") or "").lower()
+    observed = row.get("price_observed_at")
+    age_hours = None
+    try:
+        ts = pd.Timestamp(observed)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        age_hours = max(0.0, (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 3600.0)
+    except Exception:
+        pass
+    if validation == "provider_conflict":
+        price_score = 15.0
+    elif age_hours is None:
+        price_score = 55.0
+    elif age_hours <= 1.0:
+        price_score = 92.0
+    elif age_hours <= 24.0:
+        price_score = 85.0
+    elif age_hours <= 72.0:
+        price_score = 72.0
+    else:
+        price_score = 40.0
+
+    catalyst_label = str(row.get("catalyst_label") or "")
+    if catalyst_label == "Non analizzato":
+        catalyst_score = 25.0
+    elif catalyst_label in {"Nessun catalizzatore disponibile", "Solo filing SEC rilevati"}:
+        catalyst_score = 62.0
+    elif catalyst_label:
+        catalyst_score = 88.0
+    else:
+        catalyst_score = 35.0
+
+    completeness = row.get("data_completeness") or {}
+    groups = completeness.get("groups", {}) if isinstance(completeness, dict) else {}
+    valuation_score = float(groups.get("valuation", 0.0) or 0.0)
+
+    consistency = row.get("fundamental_consistency_score", 100.0)
+    try:
+        consistency = float(consistency)
+        if not math.isfinite(consistency):
+            consistency = 50.0
+    except (TypeError, ValueError):
+        consistency = 50.0
+
+    score = (
+        fundamental * 0.45
+        + price_score * 0.15
+        + catalyst_score * 0.20
+        + valuation_score * 0.10
+        + consistency * 0.10
+    )
+    validation_status = str(row.get("data_validation_status") or "").lower()
+    if validation_status == "invalid":
+        score = min(score, 45.0)
+    elif validation_status == "secondary_listing":
+        score = min(score, 55.0)
+    return round(max(0.0, min(100.0, score)), 1)
+
+
 def quote_matches_reference(quote: dict, reference) -> bool:
     """Rifiuta salti incompatibili con la chiusura EOD verificata.
 
@@ -71,6 +145,195 @@ def quote_matches_reference(quote: dict, reference) -> bool:
         return abs(price / previous - 1) <= 0.75
 
     return abs(price / reference_price - 1) <= 0.50
+
+
+def _safe_number(value):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _price_in_reporting_currency(price, listing_currency: str, reporting_currency: str):
+    """Return a directly comparable price only when no FX guess is required."""
+    price = _safe_number(price)
+    if price is None:
+        return None
+    listing = str(listing_currency or "").upper()
+    reporting = str(reporting_currency or "").upper()
+    if not reporting or listing == reporting:
+        return price
+    if listing == "GBX" and reporting == "GBP":
+        return price / 100.0
+    if listing == "GBP" and reporting == "GBX":
+        return price * 100.0
+    return None
+
+
+def reconcile_market_metrics(
+    metrics: dict,
+    technical: dict,
+    *,
+    provider_ticker: str,
+    listing_currency: str,
+    fx_rate: float | None = None,
+) -> dict:
+    """Cross-check price-dependent fundamentals before scoring/display.
+
+    Provider fields are never trusted blindly.  Market cap is checked against
+    shares × price on the primary listing, P/E against price/EPS and P/S
+    against market-cap/revenue.  Large discrepancies are repaired when a
+    deterministic same-currency calculation exists; otherwise the field is
+    withheld and confidence is reduced.
+    """
+    out = dict(metrics)
+    warnings: list[str] = []
+    listing = str(listing_currency or "").upper()
+    fundamentals_currency = str(
+        out.get("fundamentals_currency")
+        or out.get("reporting_currency")
+        or listing
+    ).upper()
+    reporting = fundamentals_currency
+    provider_symbol = str(provider_ticker or "").upper()
+    primary = str(out.get("primary_ticker") or "").upper()
+    is_primary = not primary or primary == provider_symbol
+
+    price = _safe_number(
+        technical.get("raw_eod_close")
+        or technical.get("last_close")
+        or technical.get("calculation_close")
+    )
+    comparable_price = _price_in_reporting_currency(price, listing, reporting)
+    shares = _safe_number(out.get("shares_outstanding"))
+    provider_cap = _safe_number(out.get("market_cap"))
+    derived_cap = None
+    if is_primary and comparable_price and shares and shares > 0:
+        derived_cap = comparable_price * shares
+
+    # Price-dependent fundamentals from a secondary listing can be expressed
+    # in local depositary-receipt/quotation units that are not comparable with
+    # the primary company's per-share fields.  Never present those as if they
+    # were primary-listing valuation metrics.  Search/default analysis prefers
+    # the primary listing; if a secondary listing is explicitly selected we
+    # keep its technical price history but withhold ambiguous valuation fields.
+    market_cap = provider_cap
+    market_cap_source = "provider"
+    if not is_primary:
+        warnings.append(
+            "Quotazione secondaria: multipli e capitalizzazione dipendenti dal prezzo sono esclusi finché non vengono riconciliati con la quotazione principale."
+        )
+        market_cap = None
+        market_cap_source = "secondary_listing_withheld"
+        for field in (
+            "forward_pe", "ev_to_ebitda", "ev_to_sales",
+            "price_to_book", "peg_ratio",
+        ):
+            out[field] = None
+    if is_primary and derived_cap and derived_cap > 0:
+        if provider_cap is None or provider_cap <= 0:
+            market_cap = derived_cap
+            market_cap_source = "price_x_shares"
+        else:
+            ratio = provider_cap / derived_cap
+            if ratio < 0.50 or ratio > 2.0:
+                market_cap = derived_cap
+                market_cap_source = "price_x_shares_reconciled"
+                warnings.append(
+                    "Capitalizzazione provider incoerente con prezzo × azioni; usata la stima riconciliata."
+                )
+    if market_cap is not None and (market_cap <= 0 or market_cap > 50_000_000_000_000):
+        warnings.append("Capitalizzazione fuori intervallo plausibile; dato escluso.")
+        market_cap = None
+        market_cap_source = "invalid"
+
+    out["market_cap"] = market_cap
+    out["market_cap_source"] = market_cap_source
+    out["market_cap_derived"] = derived_cap
+    out["market_cap_usd"] = None
+
+    # FX is applied only after the listing/reporting unit has been normalised.
+    try:
+        fx = float(fx_rate) if fx_rate is not None else None
+        if fx is not None and (not math.isfinite(fx) or fx <= 0):
+            fx = None
+    except (TypeError, ValueError):
+        fx = None
+    major_factor = 0.01 if reporting == "GBX" else 1.0
+    if market_cap is not None:
+        if reporting == "USD":
+            out["market_cap_usd"] = market_cap * major_factor
+        elif fx is not None and (reporting == listing or {reporting, listing} <= {"GBP", "GBX"}):
+            out["market_cap_usd"] = market_cap * major_factor * fx
+
+    eps = _safe_number(out.get("eps_ttm"))
+    provider_pe = _safe_number(out.get("pe_ratio"))
+    derived_pe = None
+    if comparable_price and eps and eps > 0:
+        derived_pe = comparable_price / eps
+    pe = provider_pe if is_primary else None
+    pe_source = "provider" if is_primary else "secondary_listing_withheld"
+    if is_primary and derived_pe and derived_pe > 0:
+        if provider_pe is None or provider_pe <= 0:
+            pe, pe_source = derived_pe, "price_div_eps_ttm"
+        else:
+            ratio = provider_pe / derived_pe
+            if ratio < 0.60 or ratio > 1.67:
+                pe, pe_source = derived_pe, "price_div_eps_ttm_reconciled"
+                warnings.append("P/E provider incoerente con prezzo/EPS TTM; usato il valore ricalcolato.")
+    if pe is not None and (pe <= 0 or pe > 1000):
+        warnings.append("P/E fuori intervallo plausibile; dato escluso.")
+        pe, pe_source = None, "invalid"
+    out["pe_ratio"] = pe
+    out["pe_basis"] = "TTM ricalcolato" if "reconciled" in pe_source or pe_source == "price_div_eps_ttm" else out.get("pe_basis", "TTM/trailing")
+    out["pe_source"] = pe_source
+    out["pe_derived"] = derived_pe
+
+    revenue = _safe_number(out.get("revenue_ttm"))
+    provider_ps = _safe_number(out.get("price_to_sales"))
+    derived_ps = market_cap / revenue if market_cap and revenue and revenue > 0 else None
+    ps = provider_ps if is_primary else None
+    ps_source = (
+        str(out.get("price_to_sales_source") or "provider")
+        if is_primary else "secondary_listing_withheld"
+    )
+    if is_primary and derived_ps and derived_ps > 0:
+        if provider_ps is None or provider_ps <= 0:
+            ps, ps_source = derived_ps, "market_cap_div_revenue_ttm"
+        else:
+            ratio = provider_ps / derived_ps
+            if ratio < 0.60 or ratio > 1.67:
+                ps, ps_source = derived_ps, "market_cap_div_revenue_ttm_reconciled"
+                warnings.append("Prezzo/ricavi provider incoerente con capitalizzazione/ricavi; usato il valore ricalcolato.")
+    if ps is not None and (ps <= 0 or ps > 500):
+        warnings.append("Prezzo/ricavi fuori intervallo plausibile; dato escluso.")
+        ps, ps_source = None, "invalid"
+    out["price_to_sales"] = ps
+    out["price_to_sales_source"] = ps_source
+
+    fcf = _safe_number(out.get("free_cash_flow_ttm"))
+    out["fcf_yield_pct"] = None
+    if fcf is not None and market_cap and market_cap > 0:
+        out["fcf_yield_pct"] = fcf / market_cap * 100.0
+
+    out["listing_currency"] = listing
+    out["currency"] = listing
+    out["fundamentals_currency"] = fundamentals_currency
+    # Backward-compatible alias used by the current mobile model.
+    out["reporting_currency"] = fundamentals_currency
+    out["is_primary_listing"] = bool(is_primary)
+    out["data_validation_warnings"] = warnings
+    if not is_primary:
+        out["data_validation_status"] = "secondary_listing"
+        out["fundamental_consistency_score"] = 35.0
+    elif warnings:
+        out["data_validation_status"] = "reconciled" if market_cap or pe or ps else "invalid"
+        out["fundamental_consistency_score"] = max(35.0, 100.0 - len(warnings) * 18.0)
+    else:
+        out["data_validation_status"] = "ok"
+        out["fundamental_consistency_score"] = 100.0
+    return out
 
 
 def base_technical(prices):
@@ -215,125 +478,100 @@ def explanation(row):
 
 def build_light_universe(
     market_provider,
-    exchanges=("us",),
+    exchanges=("nasdaq", "nyse", "amex", "bats"),
     max_return_1d_pct=-8.0,
-    min_avg_volume=200_000,
-    min_price=2.0,
+    min_avg_volume=50_000,
+    min_price=1.0,
     min_market_cap=500_000_000,
     limit_per_exchange=100,
+    max_rows=None,
 ):
+    """LIGHT SCANNER globale.
+
+    Preferisce il Bulk EOD extended del provider: in questo modo l'intero
+    universo eleggibile viene controllato senza fare una richiesta per ogni
+    singolo titolo. Il vecchio screener resta soltanto come fallback.
     """
-    LIGHT SCANNER.
+    if hasattr(market_provider, "bulk_market_universe"):
+        candidates = market_provider.bulk_market_universe(
+            exchanges=exchanges,
+            min_avg_volume=min_avg_volume,
+            min_price=min_price,
+            min_market_cap_usd=min_market_cap,
+            max_rows=max_rows,
+        )
+        if candidates is None or candidates.empty:
+            return pd.DataFrame(columns=["ticker", "company", "sector_etf"])
 
-    Usa lo screener del provider per individuare
-    rapidamente solo i titoli che hanno avuto
-    movimenti fortemente negativi.
+        rows = []
+        for _, item in candidates.iterrows():
+            ticker = str(item.get("ticker") or "").strip().upper()
+            display_ticker = str(item.get("display_ticker") or ticker.split(".")[0]).strip().upper()
+            if not ticker or not display_ticker:
+                continue
+            exchange = str(item.get("light_exchange") or ticker.rsplit(".", 1)[-1] or "US").strip().upper()
+            sector_name = str(item.get("light_sector") or "").strip()
+            row = item.to_dict()
+            row.update({
+                "ticker": ticker,
+                "display_ticker": display_ticker,
+                "company": str(item.get("company") or display_ticker),
+                "sector_etf": _benchmark_for(exchange, sector_name),
+                "benchmark_ticker": _market_benchmark(exchange),
+                "light_exchange": exchange,
+                "currency": _currency_for(exchange, item.get("currency")),
+                "asset_type": str(item.get("asset_type") or "Common Stock"),
+                "light_scanner_mode": "eodhd_bulk_global",
+            })
+            rows.append(row)
+        return pd.DataFrame(rows)
 
-    Non assegna ancora il punteggio finale.
-    Serve solo a creare la shortlist da passare
-    all'analisi approfondita.
-    """
-
-    if not hasattr(
-        market_provider,
-        "screen_candidates",
-    ):
+    if not hasattr(market_provider, "screen_candidates"):
         return None
 
     candidates = market_provider.screen_candidates(
         exchanges=exchanges,
         max_return_1d_pct=max_return_1d_pct,
-        min_avg_volume=min_avg_volume,
-        min_price=min_price,
+        min_avg_volume=max(200_000, int(min_avg_volume)),
+        min_price=max(2.0, float(min_price)),
         min_market_cap=min_market_cap,
         limit_per_exchange=limit_per_exchange,
     )
 
     if candidates is None or candidates.empty:
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "company",
-                "sector_etf",
-            ]
-        )
+        return pd.DataFrame(columns=["ticker", "company", "sector_etf"])
 
     rows = []
-
     for _, item in candidates.iterrows():
-        asset_type = str(
-            item.get("type") or item.get("Type") or item.get("asset_type") or ""
-        ).strip()
-        if any(
-            excluded in asset_type.lower()
-            for excluded in ("fund", "etf", "warrant", "preferred", "bond")
-        ):
+        asset_type = str(item.get("type") or item.get("Type") or item.get("asset_type") or "").strip()
+        if any(excluded in asset_type.lower() for excluded in ("fund", "etf", "warrant", "preferred", "bond")):
             continue
-
-        ticker = str(
-            item.get("code", "")
-        ).strip().upper()
-
+        ticker = str(item.get("code", "")).strip().upper()
         if not ticker:
             continue
-
-        company = str(
-            item.get(
-                "name",
-                ticker,
-            )
-        ).strip()
-
-        exchange = str(
-            item.get(
-                "exchange",
-                "US",
-            )
-        ).strip().upper()
-
-        api_ticker = (
-            ticker
-            if "." in ticker
-            else f"{ticker}.{exchange}"
-        )
-
+        exchange = str(item.get("exchange", "US")).strip().upper()
+        api_ticker = ticker if "." in ticker else f"{ticker}.{exchange}"
         sector_name = str(item.get("sector") or "").strip()
-        sector_etf = _benchmark_for(exchange, sector_name)
-
         rows.append({
             "ticker": api_ticker,
             "display_ticker": ticker,
-            "company": company,
-            "sector_etf": sector_etf,
+            "company": str(item.get("name", ticker)).strip(),
+            "sector_etf": _benchmark_for(exchange, sector_name),
             "benchmark_ticker": _market_benchmark(exchange),
-            "light_return_1d_pct": item.get(
-                "refund_1d_p"
-            ),
-            "light_last_price": item.get(
-                "adjusted_close"
-            ),
-            "light_market_cap": item.get(
-                "market_capitalization"
-            ),
-            "light_volume": item.get(
-                "avgvol_200d"
-            ),
+            "light_return_1d_pct": item.get("refund_1d_p"),
+            "light_last_price": item.get("adjusted_close"),
+            "light_market_cap": item.get("market_capitalization"),
+            "light_volume": item.get("avgvol_200d"),
             "light_data_date": item.get("last_day_data_date"),
-            "light_sector": item.get(
-                "sector"
-            ),
-            "light_industry": item.get(
-                "industry"
-            ),
+            "light_sector": item.get("sector"),
+            "light_industry": item.get("industry"),
             "light_exchange": exchange,
-            "currency": _currency_for(
-                exchange,
-                item.get("currency") or item.get("currency_symbol"),
-            ),
+            "currency": _currency_for(exchange, item.get("currency") or item.get("currency_symbol")),
             "country": item.get("country") or item.get("country_name"),
             "asset_type": asset_type or "Common Stock",
+            "light_anomaly_score": max(0.0, min(100.0, abs(float(item.get("refund_1d_p") or 0.0)) * 4.0)),
+            "light_scanner_mode": "eodhd_screener_fallback",
         })
-
     return pd.DataFrame(rows)
 
 
@@ -355,7 +593,7 @@ US_SECTOR_ETFS = {
 
 def _market_benchmark(exchange: str) -> str:
     code = str(exchange or "US").upper()
-    if code in {"US", "NYSE", "NASDAQ", "AMEX"}:
+    if code in {"US", "NYSE", "NASDAQ", "AMEX", "BATS"}:
         return "SPY.US"
     if code in {
         "LSE", "L", "F", "XETRA", "PA", "MI", "SW", "AS",
@@ -386,19 +624,19 @@ def _currency_for(exchange: str, value) -> str:
         return raw
     code = str(exchange or "US").upper()
     mapping = {
-        "US": "USD", "NYSE": "USD", "NASDAQ": "USD", "AMEX": "USD",
+        "US": "USD", "NYSE": "USD", "NASDAQ": "USD", "AMEX": "USD", "BATS": "USD",
         "LSE": "GBP", "TO": "CAD", "V": "CAD", "PA": "EUR",
-        "XETRA": "EUR", "MI": "EUR", "AS": "EUR", "BR": "EUR",
+        "XETRA": "EUR", "F": "EUR", "MI": "EUR", "AS": "EUR", "BR": "EUR",
         "MC": "EUR", "LS": "EUR", "SW": "CHF", "ST": "SEK",
         "CO": "DKK", "HE": "EUR", "OL": "NOK", "TSE": "JPY",
-        "HK": "HKD", "AU": "AUD", "AX": "AUD", "JSE": "ZAR",
+        "HK": "HKD", "AU": "AUD", "AX": "AUD", "JSE": "ZAR", "WAR": "PLN",
     }
     return mapping.get(code, "USD")
 
 
 def _benchmark_for(exchange: str, sector: str) -> str:
     code = str(exchange or "US").upper()
-    if code in {"US", "NYSE", "NASDAQ", "AMEX"}:
+    if code in {"US", "NYSE", "NASDAQ", "AMEX", "BATS"}:
         return US_SECTOR_ETFS.get(str(sector).lower(), "SPY.US")
     return _market_benchmark(code)
 
@@ -652,9 +890,11 @@ def scan_universe(
                         ),
                     })
 
-            listing_currency = metrics.get("currency")
+            # Quote/listing currency comes from the selected market symbol,
+            # not from the company's reporting currency in Fundamentals.
+            listing_currency = item.get("currency")
             if listing_currency is None or pd.isna(listing_currency):
-                listing_currency = item.get("currency")
+                listing_currency = metrics.get("listing_currency")
             if listing_currency is None or pd.isna(listing_currency):
                 exchange_code = item.get("light_exchange")
                 if exchange_code is None or pd.isna(exchange_code):
@@ -681,14 +921,38 @@ def scan_universe(
                 except (TypeError, ValueError):
                     pass
 
+            metrics = reconcile_market_metrics(
+                metrics,
+                technical,
+                provider_ticker=ticker,
+                listing_currency=listing_currency,
+                fx_rate=fx_rate,
+            )
             metrics = enrich_fundamental_scores(metrics)
+            metrics["fundamental_confidence_score"] = metrics.get("confidence_score")
             quality = metrics["quality_score"]
 
-            trap = value_trap_risk(
+            trap_raw = value_trap_risk(
                 metrics,
                 technical,
             )
-
+            fundamental_conf = _safe_number(metrics.get("confidence_score"))
+            if (
+                trap_raw is None
+                or fundamental_conf is None
+                or fundamental_conf < 45
+                or str(metrics.get("data_validation_status") or "").lower() in {"invalid", "secondary_listing"}
+            ):
+                trap = None
+            else:
+                # Shrink extreme 0/100 readings toward the neutral prior when
+                # the fundamental layer is incomplete. This avoids displaying
+                # false certainty from a partial dataset.
+                weight = max(0.0, min(1.0, fundamental_conf / 100.0))
+                trap = 30.0 + (float(trap_raw) - 30.0) * weight
+                trap = round(clamp(trap), 1)
+            metrics["value_trap_risk_raw"] = trap_raw
+            metrics["value_trap_confidence_score"] = fundamental_conf
             metrics["value_trap_risk"] = trap
 
             scores = score_one(
@@ -747,6 +1011,14 @@ def scan_universe(
 
             for field in [
                 "light_return_1d_pct",
+                "light_anomaly_score",
+                "light_drawdown_250d_pct",
+                "light_volume_ratio",
+                "light_ema50_pct",
+                "light_ema200_pct",
+                "light_universe_rank",
+                "light_universe_scanned",
+                "source_exchange",
                 "light_last_price",
                 "light_market_cap",
                 "light_market_cap_usd",
@@ -858,6 +1130,14 @@ def scan_universe(
                 idx,
                 key,
             ] = value
+
+    # Recompute the user-facing confidence after the catalyst pass.
+    for idx in df.index:
+        error = df.at[idx, "error"] if "error" in df.columns else None
+        if error is not None and not pd.isna(error):
+            continue
+        row_dict = df.loc[idx].to_dict()
+        df.at[idx, "confidence_score"] = overall_confidence(row_dict)
 
     opportunities = []
 

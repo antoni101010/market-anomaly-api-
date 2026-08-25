@@ -832,46 +832,31 @@ def value_trap_risk(
     )
 
 
-def confidence_score(
-    metrics: dict,
-) -> float:
+def confidence_score(metrics: dict) -> float:
+    """Completeness/freshness of the fundamental layer only.
+
+    The scanner later combines this with price and catalyst coverage so a
+    ticker can no longer display 100/100 while an important layer is missing.
     """
-    Misura quanto è completa l'analisi.
-
-    Se mancano troppi dati, Market Anomaly
-    deve dichiararlo chiaramente.
-    """
-
-    important_fields = [
-        "revenue_growth_pct",
-        "eps_growth_pct",
-        "net_margin_pct",
-        "fcf_margin_pct",
-        "pe_ratio",
-        "forward_pe",
-        "ev_to_ebitda",
-        "debt_to_ebitda",
-        "current_ratio",
-        "market_cap",
-        "shares_outstanding_growth_pct",
-    ]
-
-    available = sum(
-        1
-        for field in important_fields
-        if safe(metrics.get(field))
-        is not None
+    details = completeness_details(metrics)
+    groups = details.get("groups", {})
+    weighted = (
+        float(groups.get("valuation", 0.0)) * 0.25
+        + float(groups.get("growth_profitability", 0.0)) * 0.30
+        + float(groups.get("balance_sheet", 0.0)) * 0.30
+        + float(groups.get("dilution", 0.0)) * 0.15
     )
-
-    completeness = (
-        available
-        / len(important_fields)
-    ) * 100
-
-    return round(
-        clamp(completeness),
-        1,
-    )
+    age_days = safe(metrics.get("fundamentals_age_days"))
+    if age_days is not None:
+        if age_days > 540:
+            weighted *= 0.50
+        elif age_days > 365:
+            weighted *= 0.65
+        elif age_days > 240:
+            weighted *= 0.78
+        elif age_days > 150:
+            weighted *= 0.90
+    return round(clamp(weighted), 1)
 
 
 def completeness_details(metrics: dict) -> dict:
@@ -893,19 +878,31 @@ def completeness_details(metrics: dict) -> dict:
 
     group_scores = {}
     missing = []
+    available_count = 0
+    total_count = 0
+    cash_runway_na = (
+        str(metrics.get("cash_runway_status") or "")
+        == "not_applicable_positive_fcf"
+    )
     for group, fields in groups.items():
-        present = [field for field in fields if safe(metrics.get(field)) is not None]
+        present = []
+        for field in fields:
+            total_count += 1
+            is_present = safe(metrics.get(field)) is not None
+            if field == "cash_runway_months" and cash_runway_na:
+                is_present = True
+            if is_present:
+                present.append(field)
+                available_count += 1
+            else:
+                missing.append(field)
         group_scores[group] = round(len(present) / len(fields) * 100, 1)
-        missing.extend(field for field in fields if field not in present)
 
     return {
         "groups": group_scores,
         "missing_fields": missing,
-        "available_fields": sum(
-            1 for fields in groups.values() for field in fields
-            if safe(metrics.get(field)) is not None
-        ),
-        "total_fields": sum(len(fields) for fields in groups.values()),
+        "available_fields": available_count,
+        "total_fields": total_count,
     }
 
 

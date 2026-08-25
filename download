@@ -1,0 +1,69 @@
+name: Scansione automatica oraria
+
+on:
+  schedule:
+    - cron: '17 * * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Riattiva il backend Render
+        run: |
+          curl --fail --silent --show-error \
+            --retry 3 --retry-delay 15 --max-time 90 \
+            "https://market-anomaly-api-wd0z.onrender.com/health"
+
+      - name: Avvia la scansione
+        env:
+          MARKET_ANOMALY_API_KEY: ${{ secrets.MARKET_ANOMALY_API_KEY }}
+        run: |
+          test -n "$MARKET_ANOMALY_API_KEY"
+          curl --fail --silent --show-error \
+            --retry 2 --retry-delay 10 --max-time 90 \
+            -X POST \
+            -H "X-API-Key: $MARKET_ANOMALY_API_KEY" \
+            "https://market-anomaly-api-wd0z.onrender.com/api/scan?limit=300&catalyst_top_n=120"
+
+      - name: Attendi il completamento e verifica lo stato
+        env:
+          MARKET_ANOMALY_API_KEY: ${{ secrets.MARKET_ANOMALY_API_KEY }}
+        run: |
+          for attempt in $(seq 1 90); do
+            payload=$(curl --fail --silent --show-error --max-time 90 \
+              -H "X-API-Key: $MARKET_ANOMALY_API_KEY" \
+              "https://market-anomaly-api-wd0z.onrender.com/api/scan/status")
+            status=$(echo "$payload" | jq -r '.status')
+            if [ "$status" = "done" ]; then
+              echo "$payload"
+              exit 0
+            fi
+            if [ "$status" = "error" ]; then
+              echo "$payload"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Timeout in attesa della scansione"
+          exit 1
+
+      - name: Aggiorna indicatore globale di tensione
+        if: always()
+        env:
+          MARKET_ANOMALY_API_KEY: ${{ secrets.MARKET_ANOMALY_API_KEY }}
+        run: |
+          curl --fail --silent --show-error --max-time 90 \
+            -X POST \
+            -H "X-API-Key: $MARKET_ANOMALY_API_KEY" \
+            "https://market-anomaly-api-wd0z.onrender.com/api/market-tension/refresh"
+
+      - name: Aggiorna gli esiti storici maturati
+        if: always()
+        env:
+          MARKET_ANOMALY_API_KEY: ${{ secrets.MARKET_ANOMALY_API_KEY }}
+        run: |
+          curl --fail --silent --show-error --max-time 180 \
+            -X POST \
+            -H "X-API-Key: $MARKET_ANOMALY_API_KEY" \
+            "https://market-anomaly-api-wd0z.onrender.com/api/outcomes/update?limit=250"

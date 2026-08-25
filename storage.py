@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS latest_scan (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS latest_light_scan (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    scan_time TEXT NOT NULL,
+    market_mode TEXT,
+    universe_scanned INTEGER NOT NULL DEFAULT 0,
+    anomaly_candidates INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS scan_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     status TEXT NOT NULL,
@@ -1537,6 +1546,58 @@ def load_latest_scan():
     except Exception:
         records = []
     return scan_time, market_mode, records
+
+
+def save_latest_light_scan(
+    df: pd.DataFrame,
+    market_mode: str,
+    *,
+    universe_scanned: int | None = None,
+    anomaly_candidates: int | None = None,
+) -> None:
+    frame = df if df is not None else pd.DataFrame()
+    records = json.loads(frame.to_json(orient="records", date_format="iso"))
+    payload = json.dumps(records, default=str)
+    now = datetime.now(timezone.utc).isoformat()
+    universe_count = int(universe_scanned if universe_scanned is not None else len(frame))
+    anomaly_count = int(anomaly_candidates if anomaly_candidates is not None else len(frame))
+    with _connect() as con:
+        con.execute(
+            """
+            INSERT INTO latest_light_scan(
+                id,scan_time,market_mode,universe_scanned,anomaly_candidates,payload_json
+            ) VALUES(1,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                scan_time=excluded.scan_time,
+                market_mode=excluded.market_mode,
+                universe_scanned=excluded.universe_scanned,
+                anomaly_candidates=excluded.anomaly_candidates,
+                payload_json=excluded.payload_json
+            """,
+            (now, market_mode, universe_count, anomaly_count, payload),
+        )
+
+
+def load_latest_light_scan():
+    with _connect() as con:
+        row = con.execute(
+            "SELECT scan_time,market_mode,universe_scanned,anomaly_candidates,payload_json "
+            "FROM latest_light_scan WHERE id=1"
+        ).fetchone()
+    if not row:
+        return None, None, 0, 0, []
+    scan_time, market_mode, universe_scanned, anomaly_candidates, payload_json = row
+    try:
+        records = json.loads(payload_json)
+    except Exception:
+        records = []
+    return (
+        scan_time,
+        market_mode,
+        int(universe_scanned or 0),
+        int(anomaly_candidates or 0),
+        records,
+    )
 
 def save_scan_state(state: dict) -> None:
     with _connect() as con:

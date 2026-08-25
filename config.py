@@ -29,15 +29,11 @@ def _env_int_tuple(name: str, default: str) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class Config:
-    app_version: str = os.getenv(
-        "MARKET_ANOMALY_VERSION",
-        "2.2.0",
-    )
+    # Release identity is code-owned so stale Render env values cannot make
+    # a v2.3 deploy identify itself as v2.2.
+    app_version: str = "2.3.0"
 
-    model_version: str = os.getenv(
-        "MARKET_ANOMALY_MODEL_VERSION",
-        "ma-core-2.2.0",
-    )
+    model_version: str = "ma-core-2.3.0"
 
     app_name: str = os.getenv(
         "MARKET_ANOMALY_APP_NAME",
@@ -124,19 +120,39 @@ class Config:
     screener_exchanges: str = os.getenv(
         "MARKET_ANOMALY_EXCHANGES",
         (
-            "us,lse,to,pa,xetra,mi,sw,as,br,mc,ls,st,co,he,ol,"
-            "tse,hk,au,jse"
+            "us,lse,to,v,pa,xetra,f,mi,sw,as,br,mc,ls,st,co,he,ol,"
+            "tse,hk,au,jse,war"
         ),
     )
 
     light_universe_limit: int = int(os.getenv(
         "MARKET_ANOMALY_LIGHT_UNIVERSE_LIMIT",
-        "10000",
+        "50000",
     ))
 
+    # Numero massimo di titoli che ricevono il Deep Engine per ogni scansione.
+    # Il Light Scanner continua comunque a passare l'intero universo globale.
     deep_candidate_limit: int = int(os.getenv(
         "MARKET_ANOMALY_DEEP_CANDIDATE_LIMIT",
-        "200",
+        "300",
+    ))
+
+    # Candidati per cui il motore eventi/news viene eseguito automaticamente.
+    catalyst_candidate_limit: int = int(os.getenv(
+        "MARKET_ANOMALY_CATALYST_CANDIDATE_LIMIT",
+        "120",
+    ))
+
+    # Soglia Light puramente statistica: non elimina l'universo, serve solo
+    # a contare e prioritizzare i movimenti che meritano il Deep Engine.
+    light_anomaly_threshold: float = float(os.getenv(
+        "MARKET_ANOMALY_LIGHT_ANOMALY_THRESHOLD",
+        "20",
+    ))
+
+    bulk_cache_ttl_minutes: int = int(os.getenv(
+        "MARKET_ANOMALY_BULK_CACHE_TTL_MINUTES",
+        "45",
     ))
 
     minimum_home_confidence: float = float(os.getenv(
@@ -238,9 +254,9 @@ class Config:
         "12",
     )))
 
-    market_tension_sample_per_exchange: int = max(1, min(5, int(os.getenv(
+    market_tension_sample_per_exchange: int = max(1, min(25, int(os.getenv(
         "MARKET_ANOMALY_TENSION_SAMPLE_PER_EXCHANGE",
-        "5",
+        "25",
     ))))
 
     legal_terms_version: str = os.getenv(

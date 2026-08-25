@@ -1,235 +1,455 @@
 from __future__ import annotations
-import os
-from datetime import datetime
+
+import math
+
+import numpy as np
 import pandas as pd
-import streamlit as st
 
-from config import CONFIG
-from scanner import scan_universe
-from providers.twelve_data import TwelveDataProvider
-from providers.demo import DemoProvider
-from providers.pit_demo import DemoPointInTimeFundamentals
-from providers.sec_edgar import SecEdgarProvider
-from providers.alpha_vantage_universe import AlphaVantageUniverseProvider
-from universe_manager import normalize_universe, build_demo_historical_universe, active_snapshot, universe_summary
-from backtest import build_feature_dataset, select_signals, summarize_signals, score_buckets
-from optimizer import optimize_weights
-from walkforward import walk_forward_validate
-from bias_audit import run_bias_audit
-from statistics_engine import bootstrap_excess, sign_flip_pvalue, group_analysis, cohort_curve, weight_stability
-from model import BACKTEST_WEIGHTS
-from storage import save_signals, load_signals, add_alert_rule, list_alert_rules, delete_alert_rule
-from alerts import evaluate_alerts
+import service
+from fundamentals import completeness_details
+from providers.eodhd import EODHDProvider
+from scanner import overall_confidence
 
-st.set_page_config(page_title=CONFIG.app_name,page_icon="📉",layout="wide")
-st.title(CONFIG.app_name)
-st.caption("v2.2 — ricerca statistica su anomalie, eventi, backtest point-in-time e validazione")
 
-for k in ["live_results","bt_dataset","bt_signals","opt_result","wf_result","bt_params","alpha_universe","custom_universe"]:
-    if k not in st.session_state: st.session_state[k]=None
+def test_bulk_global_light_scanner_surfaces_app_like_anomaly(monkeypatch, tmp_path):
+    provider = EODHDProvider(api_key="test", cache_dir=str(tmp_path))
+    bulk = pd.DataFrame([
+        {
+            "code": "APP",
+            "type": "Common Stock",
+            "adjusted_close": 298.59,
+            "MarketCapitalization": 100_000_000_000,
+            "avgvol_50d": 4_000_000,
+            "avgvol_14d": 3_000_000,
+            "volume": 10_000_000,
+            "change_p": -6.0,
+            "hi_250d": 745.0,
+            "lo_250d": 219.0,
+            "ema_50d": 430.0,
+            "ema_200d": 480.0,
+            "name": "AppLovin Corp",
+        },
+        {
+            "code": "CALM",
+            "type": "Common Stock",
+            "adjusted_close": 100.0,
+            "MarketCapitalization": 30_000_000_000,
+            "avgvol_50d": 1_000_000,
+            "avgvol_14d": 1_000_000,
+            "volume": 1_000_000,
+            "change_p": -0.5,
+            "hi_250d": 110.0,
+            "lo_250d": 80.0,
+            "ema_50d": 101.0,
+            "ema_200d": 98.0,
+            "name": "Calm Corp",
+        },
+    ])
+    monkeypatch.setattr(provider, "bulk_eod_extended", lambda exchange: bulk.copy())
 
-with st.sidebar:
-    st.header("Dati di mercato")
-    price_mode=st.radio("Prezzi",["Demo","Twelve Data"],index=0)
-    twelve_key=st.text_input("Twelve Data API key",type="password") if price_mode=="Twelve Data" else ""
-    batch_size=st.slider("Batch",5,50,25,5)
-    st.header("Universo")
-    universe_mode=st.radio("Fonte",["Demo storico","CSV storico","Alpha Vantage lifecycle"],index=0)
-    alpha_key=st.text_input("Alpha Vantage API key",type="password") if universe_mode=="Alpha Vantage lifecycle" else ""
-    st.header("Scanner live")
-    live_limit=st.slider("Titoli",10,1000,100,10)
-    catalyst_top_n=st.slider("Catalyst sui migliori",1,25,7)
-    min_live=st.slider("Somiglianza storica minima",0,100,55)
-    max_trap=st.slider("Value Trap massimo",0,100,65)
-    run_live=st.button("Scansiona ora",type="primary",use_container_width=True)
+    universe = provider.bulk_market_universe(
+        ["NASDAQ"],
+        min_avg_volume=50_000,
+        min_price=1.0,
+        min_market_cap_usd=500_000_000,
+    )
 
-def market_provider():
-    return DemoProvider() if price_mode=="Demo" else TwelveDataProvider(twelve_key,batch_size=batch_size,cache_dir=CONFIG.price_cache_dir)
+    assert len(universe) == 2
+    assert universe.iloc[0]["display_ticker"] == "APP"
+    assert universe.iloc[0]["light_anomaly_score"] > 50
+    assert universe.iloc[0]["light_drawdown_250d_pct"] < -50
 
-def pit_provider():
-    return DemoPointInTimeFundamentals() if price_mode=="Demo" else SecEdgarProvider()
+    selected = service._select_deep_candidates(universe, limit=2)
+    assert selected.iloc[0]["display_ticker"] == "APP"
 
-# Universe
-if universe_mode=="Demo storico":
-    universe=build_demo_historical_universe(250)
-elif universe_mode=="CSV storico":
-    up=st.sidebar.file_uploader("CSV storico",type=["csv"])
-    if up is not None:
-        try: st.session_state.custom_universe=normalize_universe(pd.read_csv(up),source="uploaded_csv")
-        except Exception as e: st.sidebar.error(str(e))
-    universe=st.session_state.custom_universe if st.session_state.custom_universe is not None else build_demo_historical_universe(250)
-else:
-    if st.sidebar.button("Importa lifecycle USA",use_container_width=True):
-        if not alpha_key: st.sidebar.error("Inserisci API key Alpha Vantage")
-        else:
-            try:
-                st.session_state.alpha_universe=AlphaVantageUniverseProvider(alpha_key).build_lifecycle_universe(False,["NYSE","NASDAQ","AMEX"])
-            except Exception as e: st.sidebar.error(str(e))
-    universe=st.session_state.alpha_universe if st.session_state.alpha_universe is not None else build_demo_historical_universe(250)
-universe=normalize_universe(universe)
 
-if run_live:
-    if price_mode=="Twelve Data" and not twelve_key:
-        st.error("Inserisci la API key Twelve Data.")
-    else:
-        live_u=active_snapshot(universe,pd.Timestamp.today()).head(live_limit)
-        with st.spinner(f"Analizzo {len(live_u)} titoli..."):
-            st.session_state.live_results=scan_universe(live_u,market_provider(),include_sec=(price_mode=="Twelve Data"),catalyst_top_n=catalyst_top_n)
+def test_global_exchange_core_survives_old_narrow_render_env(monkeypatch):
+    class Config:
+        screener_exchanges = "us,lse"
 
-tabs=st.tabs(["Dashboard","Scanner","Catalyst","Backtest","Statistica","Walk-forward","Universo & Bias","Alert","Storico","Setup commerciale"])
+    monkeypatch.setattr(service, "CONFIG", Config())
+    exchanges = service._global_scan_exchanges()
+    assert "US" in exchanges
+    assert "NASDAQ" not in exchanges
+    assert "NYSE" not in exchanges
+    assert "TSE" in exchanges
+    assert "HK" in exchanges
+    assert "AU" in exchanges
+    assert "LSE" in exchanges
 
-with tabs[0]:
-    st.subheader("Dashboard")
-    df=st.session_state.live_results
-    if df is None:
-        st.info("Esegui una scansione live. In modalità Demo non servono API key.")
-    else:
-        valid=df[df['error'].isna()].copy()
-        candidates=valid[(valid['opportunity_score']>=min_live)&(valid['value_trap_risk']<=max_trap)].copy()
-        a,b,c,d=st.columns(4)
-        a.metric("Analizzati",len(valid)); b.metric("Candidati",len(candidates))
-        c.metric("Somiglianza storica max",f"{valid['opportunity_score'].max():.1f}" if len(valid) else "-")
-        d.metric("Anomaly max",f"{valid['anomaly_score'].max():.1f}" if len(valid) else "-")
-        if len(candidates):
-            st.dataframe(candidates[["ticker","company","opportunity_score","anomaly_score","value_trap_risk","catalyst_risk","quality_score","catalyst_label"]].head(20).rename(columns={"opportunity_score":"somiglianza_casi_storici"}),use_container_width=True,hide_index=True)
-            hits=evaluate_alerts(valid)
-            if not hits.empty: st.success(f"{len(hits)} alert attivi scattati.")
 
-with tabs[1]:
-    st.subheader("Top anomalie")
-    df=st.session_state.live_results
-    if df is None: st.info("Esegui la scansione live.")
-    else:
-        valid=df[df['error'].isna()].copy()
-        filt=valid[(valid['opportunity_score']>=min_live)&(valid['value_trap_risk']<=max_trap)].copy()
-        st.dataframe(filt[["ticker","company","opportunity_score","anomaly_score","recovery_potential","value_trap_risk","catalyst_risk","quality_score","drawdown_52w_pct","relative_60d_vs_spy_pct"]].rename(columns={"opportunity_score":"somiglianza_casi_storici","recovery_potential":"pattern_recupero_storico"}),use_container_width=True,hide_index=True)
-        if len(filt):
-            tic=st.selectbox("Scheda",filt['ticker'].tolist(),key="scan_ticker")
-            r=filt[filt.ticker==tic].iloc[0]
-            a,b,c,d=st.columns(4)
-            a.metric("Casi storici",f"{r.opportunity_score:.1f}/100"); b.metric("Anomaly",f"{r.anomaly_score:.1f}/100")
-            c.metric("Value Trap",f"{r.value_trap_risk:.1f}/100"); d.metric("Catalyst Risk",f"{r.catalyst_risk:.1f}/100")
-            st.write(r.explanation); st.info(f"{r.catalyst_label}: {r.catalyst_explanation}")
-            if st.button("Salva candidati",key="save_live"): st.success(f"Salvati {save_signals(filt)} segnali")
-            st.download_button("Esporta CSV",filt.to_csv(index=False).encode(),"market_anomaly_live.csv","text/csv")
+def test_positive_fcf_cash_runway_is_not_counted_missing():
+    metrics = {
+        "cash_runway_months": None,
+        "cash_runway_status": "not_applicable_positive_fcf",
+    }
+    details = completeness_details(metrics)
+    assert "cash_runway_months" not in details["missing_fields"]
+    assert details["available_fields"] >= 1
 
-with tabs[2]:
-    st.subheader("Catalyst Lab")
-    df=st.session_state.live_results
-    if df is None: st.info("Esegui prima una scansione.")
-    else:
-        ana=df[(df['error'].isna())&(df['catalyst_label']!='Non analizzato')]
-        for _,r in ana.iterrows():
-            with st.expander(f"{r.ticker} — {r.catalyst_label} — rischio {r.catalyst_risk:.0f}/100"):
-                st.write(r.catalyst_explanation)
-                for item in (r.get('catalyst_items') or []): st.write(f"• {item.get('datetime','')} {item.get('title','')}")
-                for f in (r.get('recent_filings') or []): st.write(f"• SEC {f.get('filing_date','')} — {f.get('form','')}")
 
-with tabs[3]:
-    st.subheader("Backtest point-in-time")
-    c1,c2,c3,c4=st.columns(4)
-    years=c1.slider("Anni",2,12,5,key="bt_years"); scan_every=c2.select_slider("Ogni sedute",[5,10,15,20],value=10)
-    horizon=c3.selectbox("Orizzonte",[20,60,90],index=1); threshold=c4.slider("Score minimo",20,90,50,key="bt_threshold")
-    c1,c2,c3,c4=st.columns(4)
-    top_n=c1.slider("Top per data",1,10,3); cooldown=c2.slider("Cooldown",0,8,2)
-    commission=c3.number_input("Commissione bps/lato",0.0,50.0,5.0); slippage=c4.number_input("Slippage bps/lato",0.0,100.0,10.0)
-    use_pit=st.checkbox("Fondamentali point-in-time",value=True)
-    max_bt=max(20,min(1500,len(universe))); default_bt=min(250,max_bt)
-    bt_limit=st.slider("Titoli nel backtest",20,max_bt,default_bt,10)
-    if st.button("Esegui backtest",type="primary",key="run_bt"):
-        if price_mode=="Twelve Data" and not twelve_key: st.error("Serve la API key Twelve Data.")
-        else:
-            bt_u=universe.head(bt_limit)
-            with st.spinner("Costruisco il dataset storico senza usare dati futuri..."):
-                ds=build_feature_dataset(bt_u,market_provider(),years,scan_every,fundamental_provider=pit_provider() if use_pit else None,adjust="all",commission_bps=commission,slippage_bps=slippage)
-                sig=select_signals(ds,BACKTEST_WEIGHTS,threshold,top_n,cooldown)
-                st.session_state.bt_dataset=ds; st.session_state.bt_signals=sig
-                st.session_state.bt_params={"horizon":horizon,"threshold":threshold,"top_n":top_n,"cooldown":cooldown,"commission":commission,"slippage":slippage,"use_pit":use_pit,"universe":bt_u}
-    sig=st.session_state.bt_signals
-    if sig is not None:
-        h=st.session_state.bt_params['horizon']; m=summarize_signals(sig,h)
-        a,b,c,d,e=st.columns(5)
-        a.metric("Segnali",m['signals']); b.metric("Rendimento netto",f"{m['avg_return']:.2f}%"); c.metric("Excess vs SPY",f"{m['avg_excess']:.2f}%")
-        d.metric("Batte SPY",f"{m['beat_spy_rate']:.1f}%"); e.metric("Delisting",m.get('delist_events',0))
-        st.dataframe(score_buckets(sig,h),use_container_width=True,hide_index=True)
-        st.download_button("Scarica backtest",sig.to_csv(index=False).encode(),"market_anomaly_backtest.csv","text/csv")
+def test_overall_confidence_cannot_be_100_without_catalyst_context():
+    row = {
+        "fundamental_confidence_score": 100.0,
+        "price_validation": "provider_matches_eod",
+        "price_observed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        "catalyst_label": "Non analizzato",
+        "data_completeness": {"groups": {"valuation": 100.0}},
+    }
+    score = overall_confidence(row)
+    assert score < 85
+    assert score > 0
 
-with tabs[4]:
-    st.subheader("Validazione statistica")
-    sig=st.session_state.bt_signals
-    if sig is None or sig.empty: st.info("Esegui prima il backtest.")
-    else:
-        h=st.session_state.bt_params['horizon']
-        boot=bootstrap_excess(sig,h,3000); p=sign_flip_pvalue(sig,h,5000)
-        curve,cs=cohort_curve(sig,h)
-        a,b,c,d=st.columns(4)
-        a.metric("Excess medio",f"{boot['mean_excess']:.2f}%"); b.metric("Bootstrap CI95",f"{boot['ci95_low']:.2f} / {boot['ci95_high']:.2f}%")
-        c.metric("P(excess > 0)",f"{boot['prob_gt_zero']:.1f}%"); d.metric("Permutation p-value",f"{p:.4f}")
-        if cs:
-            a,b,c=st.columns(3); a.metric("Cohort total",f"{cs['strategy_total_pct']:.1f}%"); b.metric("Benchmark cohort",f"{cs['benchmark_total_pct']:.1f}%"); c.metric("Max drawdown",f"{cs['max_drawdown_pct']:.1f}%")
-            st.line_chart(curve.set_index('signal_date')[["strategy_equity","benchmark_equity"]])
-        st.markdown("#### Per regime di mercato")
-        st.dataframe(group_analysis(sig,'market_regime',h),use_container_width=True,hide_index=True)
-        st.markdown("#### Per settore")
-        st.dataframe(group_analysis(sig,'sector_etf',h),use_container_width=True,hide_index=True)
-        if p < 0.05 and boot['ci95_low']>0: st.success("Il vantaggio osservato supera i controlli statistici base di questa versione.")
-        else: st.warning("Il vantaggio osservato NON è ancora abbastanza robusto da considerarlo dimostrato.")
 
-with tabs[5]:
-    st.subheader("Walk-forward")
-    ds=st.session_state.bt_dataset
-    if ds is None: st.info("Esegui prima il backtest.")
-    else:
-        c1,c2,c3=st.columns(3)
-        tr=c1.slider("Train anni",1,5,3); tm=c2.selectbox("Test mesi",[3,6,12],index=1); it=c3.slider("Tentativi/fold",20,250,80,20)
-        if st.button("Esegui walk-forward"):
-            p=st.session_state.bt_params
-            st.session_state.wf_result=walk_forward_validate(ds,p['horizon'],tr,tm,it,p['threshold'],p['top_n'],p['cooldown'])
-        wf=st.session_state.wf_result
-        if wf:
-            m=wf['overall']; wt,stab=weight_stability(wf['folds'])
-            a,b,c,d=st.columns(4); a.metric("Affidabilità",wf['reliability_grade']); b.metric("Excess OOS",f"{m['avg_excess']:.2f}%"); c.metric("Fold positivi",f"{wf['positive_folds_pct']:.1f}%"); d.metric("Stabilità pesi",f"{stab:.0f}/100")
-            st.dataframe(wf['folds'],use_container_width=True,hide_index=True); st.dataframe(wt,use_container_width=True,hide_index=True)
+class _LongHistoryProvider:
+    def daily_history(self, symbol: str, outputsize: int = 300):
+        periods = max(1500, outputsize)
+        dates = pd.date_range("2021-01-01", periods=periods, freq="B")
+        close = np.linspace(100.0, 200.0, periods)
+        # A sharp peak that display downsampling is allowed to skip, but summary is not.
+        close[733] = 1000.0
+        return pd.DataFrame({
+            "datetime": dates,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "raw_close": close,
+            "volume": np.ones(periods) * 1000,
+        })
 
-with tabs[6]:
-    st.subheader("Universo storico e Bias Audit")
-    us=universe_summary(universe)
-    a,b,c,d=st.columns(4); a.metric("Simboli",us['symbols']); b.metric("Lifecycle",f"{us['lifecycle_coverage_pct']:.1f}%"); c.metric("Delistati",us['delisted_symbols']); d.metric("Terminal return",f"{us['terminal_return_coverage_pct']:.1f}%")
-    date=st.date_input("Snapshot storico",value=pd.Timestamp('2022-06-30').date()); snap=active_snapshot(universe,date)
-    st.dataframe(snap[[c for c in ['ticker','company','sector_etf','active_from','active_to','delisting_return_pct','universe_source'] if c in snap.columns]].head(1000),use_container_width=True,hide_index=True)
-    p=st.session_state.bt_params or {"use_pit":False,"commission":5,"slippage":10,"universe":universe}
-    audit=run_bias_audit(p.get('universe',universe),st.session_state.bt_dataset,'all',p.get('use_pit',False),p.get('commission',5),p.get('slippage',10))
-    a,b=st.columns(2); a.metric("Bias grade",audit.attrs.get('audit_grade','-')); b.metric("Audit score",f"{audit.attrs.get('audit_score_pct',0):.1f}%")
-    st.dataframe(audit,use_container_width=True,hide_index=True)
+    def latest_quote(self, symbol: str):
+        raise RuntimeError("no quote in synthetic test")
 
-with tabs[7]:
-    st.subheader("Alert Center")
-    with st.form("new_alert"):
-        name=st.text_input("Nome regola",value="Top anomaly")
-        a,b,c,d=st.columns(4)
-        mo=a.number_input("Somiglianza storica ≥",0,100,75); ma=b.number_input("Anomaly ≥",0,100,60); vt=c.number_input("Value Trap ≤",0,100,50); cr=d.number_input("Catalyst Risk ≤",0,100,60)
-        if st.form_submit_button("Salva regola"):
-            add_alert_rule(name,mo,ma,vt,cr); st.success("Regola salvata")
-    rules=list_alert_rules(); st.dataframe(rules,use_container_width=True,hide_index=True)
-    if not rules.empty:
-        rid=st.selectbox("Elimina regola",rules['id'].tolist(),format_func=lambda x: f"{x} — {rules[rules.id==x].iloc[0]['name']}")
-        if st.button("Elimina",key="del_rule"): delete_alert_rule(rid); st.success("Regola eliminata")
-    if st.session_state.live_results is not None:
-        hits=evaluate_alerts(st.session_state.live_results,rules); st.markdown("#### Alert scattati"); st.dataframe(hits,use_container_width=True,hide_index=True)
 
-with tabs[8]:
-    st.subheader("Storico segnali")
-    hist=load_signals(); st.dataframe(hist,use_container_width=True,hide_index=True)
+def test_price_windows_are_calendar_based_and_stats_use_full_series(monkeypatch):
+    provider = _LongHistoryProvider()
+    monkeypatch.setattr(service, "_market_provider", lambda: provider)
+    monkeypatch.setattr(service, "_provider_ticker_for", lambda _: "APP.US")
+    monkeypatch.setattr(service, "load_latest_scan", lambda: (None, "live", []))
 
-with tabs[9]:
-    st.subheader("Setup commerciale")
-    st.markdown("""
-La v2.2 include il livello legale nell'app mobile, la metodologia, la tracciatura versionata dell'accettazione e il Global Market Tension Engine. Prima di una vendita pubblica restano da verificare gli elementi esterni al codice: licenza commerciale dei dati, hosting/dominio, eventuale autenticazione e pagamenti e revisione professionale del modello commerciale concreto.
+    one_month = service.get_price_history("APP", period="1M")
+    start = pd.Timestamp(one_month["points"][0]["time"])
+    end = pd.Timestamp(one_month["points"][-1]["time"])
+    assert 25 <= (end - start).days <= 35
 
-Il prodotto è progettato come **strumento di ricerca statistica**. Non determina l'adeguatezza di uno strumento per una persona, non gestisce portafogli, non esegue ordini e non formula istruzioni personalizzate di acquisto o vendita.
-""")
-    st.code("streamlit run app.py")
-    st.caption("Per SEC imposta SEC_USER_AGENT con nome progetto + email di contatto reale.")
+    five_year = service.get_price_history("APP", period="5A")
+    assert five_year["summary"]["period_high"] == 1000.0
+    assert len(five_year["points"]) <= 501
+    assert math.isfinite(five_year["summary"]["max_drawdown_pct"])
 
-st.divider()
-st.caption("Market Anomaly v2.2 — ricerca statistica. Dati e risultati storici possono essere incompleti o ritardati e non garantiscono risultati futuri.")
+
+def test_deep_selection_uses_full_300_budget_on_20k_universe():
+    size = 20_000
+    frame = pd.DataFrame({
+        "ticker": [f"T{i:05d}.US" for i in range(size)],
+        "display_ticker": [f"T{i:05d}" for i in range(size)],
+        "light_anomaly_score": np.linspace(100.0, 0.0, size),
+        "light_market_cap_usd": np.linspace(10_000_000_000, 500_000_000, size),
+        "source_exchange": ["NASDAQ", "NYSE", "LSE", "TSE", "AU"] * (size // 5),
+    })
+
+    selected = service._select_deep_candidates(frame, limit=300)
+
+    assert len(selected) == 300
+    assert selected["ticker"].is_unique
+    assert selected.iloc[0]["ticker"] == "T00000.US"
+
+
+def test_nvda_like_corrupt_price_dependent_fundamentals_are_reconciled():
+    from scanner import reconcile_market_metrics
+
+    metrics = {
+        "fundamentals_currency": "USD",
+        "primary_ticker": "NVDA.US",
+        "shares_outstanding": 24_250_000_000,
+        "eps_ttm": 6.53,
+        # Values deliberately model the bad screen the user observed.
+        "market_cap": 336_430_000_000_000,
+        "pe_ratio": 1.4,
+        "price_to_sales": None,
+        "revenue_ttm": 253_490_000_000,
+        "free_cash_flow_ttm": 120_000_000_000,
+    }
+    technical = {
+        "raw_eod_close": 208.48,
+        "last_close": 208.48,
+    }
+
+    fixed = reconcile_market_metrics(
+        metrics,
+        technical,
+        provider_ticker="NVDA.US",
+        listing_currency="USD",
+        fx_rate=1.0,
+    )
+
+    expected_cap = 208.48 * 24_250_000_000
+    assert fixed["is_primary_listing"] is True
+    assert math.isclose(fixed["market_cap"], expected_cap, rel_tol=1e-9)
+    assert fixed["market_cap"] < 6_000_000_000_000
+    assert 30 < fixed["pe_ratio"] < 35
+    assert 18 < fixed["price_to_sales"] < 22
+    assert fixed["data_validation_status"] == "reconciled"
+    assert len(fixed["data_validation_warnings"]) >= 2
+
+
+def test_secondary_listing_withholds_ambiguous_price_dependent_fundamentals():
+    from scanner import reconcile_market_metrics
+
+    fixed = reconcile_market_metrics(
+        {
+            "fundamentals_currency": "ARS",
+            "primary_ticker": "NVDA.US",
+            "shares_outstanding": 24_250_000_000,
+            "eps_ttm": 6.53,
+            "market_cap": 33_643_000_000_000,
+            "pe_ratio": 1.4,
+            "price_to_sales": 0.2,
+            "revenue_ttm": 253_490_000_000,
+            "free_cash_flow_ttm": 120_000_000_000,
+        },
+        {"raw_eod_close": 14_040.0, "last_close": 14_040.0},
+        provider_ticker="NVDA.BA",
+        listing_currency="ARS",
+        fx_rate=None,
+    )
+
+    assert fixed["is_primary_listing"] is False
+    assert fixed["market_cap"] is None
+    assert fixed["pe_ratio"] is None
+    assert fixed["price_to_sales"] is None
+    assert fixed["fcf_yield_pct"] is None
+    assert fixed["data_validation_status"] == "secondary_listing"
+    assert fixed["fundamental_consistency_score"] <= 35
+
+
+def test_exact_search_prioritizes_primary_listing(monkeypatch):
+    class Provider:
+        def search_symbols(self, query, limit=12):
+            assert limit == 25
+            return [
+                {
+                    "ticker": "NVDA",
+                    "provider_ticker": "NVDA.BA",
+                    "company": "NVIDIA Corporation",
+                    "exchange": "BA",
+                    "venue": "Buenos Aires",
+                    "currency": "ARS",
+                    "country": "Argentina",
+                    "is_primary": False,
+                    "type": "Common Stock",
+                },
+                {
+                    "ticker": "NVDA",
+                    "provider_ticker": "NVDA.US",
+                    "company": "NVIDIA Corporation",
+                    "exchange": "US",
+                    "venue": "NASDAQ",
+                    "currency": "USD",
+                    "country": "USA",
+                    "is_primary": True,
+                    "type": "Common Stock",
+                },
+            ]
+
+    monkeypatch.setattr(service, "_market_provider", lambda: Provider())
+    monkeypatch.setattr(service, "_local_search_rows", lambda: [])
+
+    results = service.search_tickers("NVDA", limit=12)
+
+    assert results[0]["provider_ticker"] == "NVDA.US"
+    assert results[0]["is_primary"] is True
+
+
+def test_intraday_null_fields_are_sanitized(monkeypatch, tmp_path):
+    provider = EODHDProvider(api_key="test", cache_dir=str(tmp_path))
+    payload = [
+        {
+            "datetime": "2026-08-25 13:30:00",
+            "open": None,
+            "high": None,
+            "low": None,
+            "close": "100.125",
+            "volume": None,
+        },
+        {
+            "datetime": "2026-08-25 13:35:00",
+            "open": "100.125",
+            "high": "101.0",
+            "low": "99.75",
+            "close": "100.5",
+            "volume": "12345",
+        },
+    ]
+    monkeypatch.setattr(provider, "_request", lambda *args, **kwargs: payload)
+
+    frame = provider.intraday_history("APP.US", days=1, interval="5m")
+
+    assert len(frame) == 2
+    assert frame["close"].notna().all()
+    assert frame["open"].notna().all()
+    assert frame["high"].notna().all()
+    assert frame["low"].notna().all()
+    assert frame["volume"].notna().all()
+    assert frame.iloc[0]["open"] == frame.iloc[0]["close"]
+    assert frame.iloc[0]["volume"] == 0.0
+
+
+def test_dashboard_can_browse_normal_light_band_without_deep(monkeypatch):
+    monkeypatch.setattr(service, "load_latest_scan", lambda: (None, "live", []))
+    monkeypatch.setattr(
+        service,
+        "load_latest_light_scan",
+        lambda: (
+            "2026-08-25T12:00:00+00:00",
+            "live",
+            20_000,
+            500,
+            [
+                {
+                    "ticker": "NORMAL.US",
+                    "display_ticker": "NORMAL",
+                    "company": "Normal Anomaly Corp",
+                    "light_anomaly_score": 30.0,
+                    "light_last_price": 12.345,
+                    "light_drawdown_250d_pct": -25.0,
+                    "light_market_cap_usd": 2_000_000_000,
+                    "light_volume": 1_000_000,
+                    "light_exchange": "NASDAQ",
+                    "currency": "USD",
+                    "light_data_date": "2026-08-25",
+                },
+                {
+                    "ticker": "STRONG.US",
+                    "display_ticker": "STRONG",
+                    "company": "Strong Anomaly Corp",
+                    "light_anomaly_score": 72.0,
+                    "light_last_price": 50.0,
+                    "light_drawdown_250d_pct": -55.0,
+                    "light_market_cap_usd": 5_000_000_000,
+                    "light_volume": 2_000_000,
+                    "light_exchange": "NYSE",
+                    "currency": "USD",
+                    "light_data_date": "2026-08-25",
+                },
+            ],
+        ),
+    )
+    monkeypatch.setattr(service, "get_market_tension", lambda: {"status": "unavailable"})
+    monkeypatch.setattr(service, "is_in_watchlist", lambda ticker: False)
+
+    class Provider:
+        def batch_latest_quotes(self, symbols):
+            return {}
+
+        def latest_quote(self, symbol):
+            raise RuntimeError("synthetic no quote")
+
+    monkeypatch.setattr(service, "_market_provider", lambda: Provider())
+
+    result = service.get_dashboard(
+        min_opportunity=0,
+        min_confidence=0,
+        min_valuation=0,
+        min_anomaly=20,
+        max_anomaly=39.999,
+        top_n=30,
+    )
+
+    assert result["stats"]["universe_scanned"] == 20_000
+    assert result["stats"]["deep_analyzed"] == 0
+    assert result["stats"]["displayed"] == 1
+    assert result["top_anomalies"][0]["ticker"] == "NORMAL"
+    assert result["top_anomalies"][0]["provider_ticker"] == "NORMAL.US"
+    assert result["top_anomalies"][0]["analysis_level"] == "light"
+    assert result["top_anomalies"][0]["opportunity_score"] is None
+
+
+def test_provider_ticker_prevents_same_symbol_cross_market_collision(monkeypatch):
+    records = [
+        {
+            "ticker": "ABC",
+            "provider_ticker": "ABC.US",
+            "company": "ABC United States",
+            "is_primary_listing": True,
+            "last_close": 10.0,
+        },
+        {
+            "ticker": "ABC",
+            "provider_ticker": "ABC.AU",
+            "company": "ABC Australia",
+            "is_primary_listing": True,
+            "last_close": 20.0,
+        },
+    ]
+    monkeypatch.setattr(service, "load_latest_scan", lambda: (None, "live", records))
+    monkeypatch.setattr(
+        service,
+        "_refresh_record_quote",
+        lambda row, provider=None, prefer_realtime=False: dict(row),
+    )
+    monkeypatch.setattr(
+        service,
+        "build_ticker_narrative",
+        lambda row: {"classification": {"label": "TEST"}, "summary": "", "data_gaps": []},
+    )
+    monkeypatch.setattr(service, "is_in_watchlist", lambda ticker: False)
+
+    assert service._provider_ticker_for("ABC.AU") == "ABC.AU"
+    detail = service.get_ticker_detail("ABC.AU")
+    assert detail is not None
+    assert detail["company"] == "ABC Australia"
+    assert detail["provider_ticker"] == "ABC.AU"
+
+
+def test_global_exchange_normalizes_stale_us_venue_env(monkeypatch):
+    class Config:
+        screener_exchanges = "nasdaq,nyse,amex,bats,lse"
+
+    monkeypatch.setattr(service, "CONFIG", Config())
+    exchanges = service._global_scan_exchanges()
+    assert exchanges.count("US") == 1
+    assert "NASDAQ" not in exchanges
+    assert "NYSE" not in exchanges
+    assert "AMEX" not in exchanges
+    assert "BATS" not in exchanges
+
+
+def test_price_history_prefers_realtime_us_quote(monkeypatch):
+    class Provider:
+        def daily_history(self, symbol, outputsize=300):
+            dates = pd.date_range("2026-07-20", periods=30, freq="B")
+            close = np.linspace(190.0, 208.0, len(dates))
+            return pd.DataFrame({
+                "datetime": dates,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "raw_close": close,
+                "volume": np.ones(len(dates)) * 1_000_000,
+            })
+
+        def realtime_trade_quote(self, symbol):
+            assert symbol == "NVDA.US"
+            return {
+                "price": 209.25,
+                "observed_at": "2026-08-25T14:00:00+00:00",
+                "source": "eodhd_websocket_realtime",
+                "is_delayed": False,
+                "market_status": "open",
+            }
+
+        def latest_quote(self, symbol):
+            raise AssertionError("Delayed REST quote should not be used when realtime succeeds")
+
+    monkeypatch.setattr(service, "_market_provider", lambda: Provider())
+    monkeypatch.setattr(service, "_provider_ticker_for", lambda _: "NVDA.US")
+    monkeypatch.setattr(service, "load_latest_scan", lambda: (None, "live", []))
+
+    history = service.get_price_history("NVDA.US", "1M")
+    assert history["summary"]["current_price"] == 209.25
+    assert history["summary"]["current_price_source"] == "eodhd_websocket_realtime"
+    assert history["summary"]["current_price_status"] == "live"
+    assert history["summary"]["current_price_is_delayed"] is False
